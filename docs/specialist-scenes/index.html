@@ -19,11 +19,22 @@
   .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:20px}
   .card{background:var(--panel); border:1px solid var(--hair); border-radius:14px; overflow:hidden;
         display:flex; flex-direction:column}
-  .card img{width:100%; aspect-ratio:8/5; object-fit:cover; display:block; background:#0b0f14}
+  .card img{width:100%; aspect-ratio:16/9; object-fit:cover; display:block; background:#0b0f14}
   .card .body{padding:16px 18px 18px; display:flex; flex-direction:column; flex:1}
   .card .theme{font-size:15px; color:var(--ink); margin-bottom:8px}
   .card .meta{font-size:12.5px; color:var(--dim); font-family:ui-monospace,Menlo,monospace}
-  .card .why{font-size:13.5px; color:var(--dim); margin-top:8px; flex:1}
+  .card .why{font-size:13.5px; color:var(--dim); margin-top:8px}
+  .card details{margin-top:8px}
+  .card details summary{font-size:12.5px; color:var(--dim); cursor:pointer; list-style:none;
+        display:inline-flex; align-items:center; gap:6px; user-select:none; padding:2px 0}
+  .card details summary::-webkit-details-marker{display:none}
+  .card details summary::before{content:"\25B8"; font-size:10px; color:var(--accent);
+        transition:transform .12s ease; display:inline-block}
+  .card details[open] summary::before{transform:rotate(90deg)}
+  .card details summary:hover{color:var(--ink)}
+  .card details .why{margin-top:7px}
+  .card details blockquote{margin-top:7px; font-size:13.5px; color:var(--ink); border-left:2px solid #3d2f56;
+        padding-left:11px}
   .card a.play{display:inline-block; margin-top:12px; font-size:14px; color:var(--accent); text-decoration:none;
                border:1px solid #3d2f56; padding:6px 13px; border-radius:8px; align-self:flex-start}
   .card a.play:hover{background:#221a33}
@@ -87,7 +98,10 @@
       <div class="body">
         <div class="theme">High Park</div>
         <div class="meta">4 states · 12 layers</div>
-        <p class="why">Open daylight landscape — one sun, wind over turf. The world all six specialists were trained on.</p>
+        <details>
+          <summary>What makes it different</summary>
+          <p class="why">Open daylight landscape — one sun, wind over turf. The world all six specialists were trained on.</p>
+        </details>
         <a class="play" href="worlds/highpark.cdn.html">Open world →</a>
       </div>
     </div>
@@ -97,8 +111,11 @@
       <div class="body">
         <div class="theme">Cenote</div>
         <div class="meta">4 states · 8 layers</div>
-        <p class="why">Light enters as a single shaft through a hole in the roof; caustics on the floor, and a diver's
+        <details>
+          <summary>What makes it different</summary>
+          <p class="why">Light enters as a single shaft through a hole in the roof; caustics on the floor, and a diver's
         torch as a second, moving source.</p>
+        </details>
         <a class="play" href="worlds/cenote.cdn.html">Open world →</a>
       </div>
     </div>
@@ -108,8 +125,11 @@
       <div class="body">
         <div class="theme">Canyon</div>
         <div class="meta">4 states · 5 layers</div>
-        <p class="why">A slot canyon. Most of the light on a shaded wall arrives <em>bounced off the opposite sunlit
+        <details>
+          <summary>What makes it different</summary>
+          <p class="why">A slot canyon. Most of the light on a shaded wall arrives <em>bounced off the opposite sunlit
         wall</em>, not from the sky — layers that ignore it read as flat cut-outs.</p>
+        </details>
         <a class="play" href="worlds/canyon.cdn.html">Open world →</a>
       </div>
     </div>
@@ -119,8 +139,11 @@
       <div class="body">
         <div class="theme">Glacier</div>
         <div class="meta">4 states · 5 layers</div>
-        <p class="why">Inverted exposure: very bright, low contrast, snow scattering light back up so shadows are blue
+        <details>
+          <summary>What makes it different</summary>
+          <p class="why">Inverted exposure: very bright, low contrast, snow scattering light back up so shadows are blue
         and filled, never black. The ice is translucent and glows from within.</p>
+        </details>
         <a class="play" href="worlds/glacier.cdn.html">Open world →</a>
       </div>
     </div>
@@ -130,8 +153,11 @@
       <div class="body">
         <div class="theme">Caldera</div>
         <div class="meta">4 states · 5 layers</div>
-        <p class="why">Light comes from the <em>ground</em> — glowing fissures in cooled basalt. Faces point down
+        <details>
+          <summary>What makes it different</summary>
+          <p class="why">Light comes from the <em>ground</em> — glowing fissures in cooled basalt. Faces point down
         toward the light, shadows fall upward, and the sky is the darkest thing in frame.</p>
+        </details>
         <a class="play" href="worlds/caldera.cdn.html">Open world →</a>
       </div>
     </div>
@@ -141,8 +167,11 @@
       <div class="body">
         <div class="theme">Sea state</div>
         <div class="meta">20 states · partial host</div>
-        <p class="why">Open ocean, twenty lighting states. A partial world — ocean, rain and sky only — kept because
+        <details>
+          <summary>What makes it different</summary>
+          <p class="why">Open ocean, twenty lighting states. A partial world — ocean, rain and sky only — kept because
         the water-presence check is calibrated against it.</p>
+        </details>
         <a class="play" href="worlds/seastate.cdn.html">Open world →</a>
       </div>
     </div>
@@ -162,7 +191,11 @@
     <div class="card">
       <img src="shots/scene-000.png" alt="Storm over the prairie with a bison herd" />
       <div class="body">
-        <div class="theme">“a storm breaking over the high prairie as a bison herd bunches and runs for shelter”</div>
+        <div class="theme">Storm over the prairie</div>
+        <details>
+          <summary>The brief it was built from</summary>
+          <blockquote>“a storm breaking over the high prairie as a bison herd bunches and runs for shelter”</blockquote>
+        </details>
         <div class="meta">6/6 layers accepted · every layer first attempt · 626 s</div>
         <a class="play" href="scenes/scene-000.html">Open scene →</a>
       </div>
@@ -171,7 +204,11 @@
     <div class="card">
       <img src="shots/scene-001.png" alt="Misty dawn with elk in the hollows" />
       <div class="body">
-        <div class="theme">“a hushed misty dawn with elk grazing quietly in the hollows”</div>
+        <div class="theme">Misty dawn</div>
+        <details>
+          <summary>The brief it was built from</summary>
+          <blockquote>“a hushed misty dawn with elk grazing quietly in the hollows”</blockquote>
+        </details>
         <div class="meta">6/6 layers accepted · camera took 2 attempts · 703 s</div>
         <a class="play" href="scenes/scene-001.html">Open scene →</a>
       </div>
@@ -180,7 +217,11 @@
     <div class="card">
       <img src="shots/scene-002.png" alt="Windy midsummer afternoon with wild horses" />
       <div class="body">
-        <div class="theme">“a bright windy midsummer afternoon with wild horses crossing rippling grass”</div>
+        <div class="theme">Windy midsummer</div>
+        <details>
+          <summary>The brief it was built from</summary>
+          <blockquote>“a bright windy midsummer afternoon with wild horses crossing rippling grass”</blockquote>
+        </details>
         <div class="meta">6/6 layers accepted · sky took 2 attempts · 598 s</div>
         <a class="play" href="scenes/scene-002.html">Open scene →</a>
       </div>
@@ -189,7 +230,11 @@
     <div class="card">
       <img src="shots/scene-003.png" alt="Cold grey overcast day with elk on grazed turf" />
       <div class="body">
-        <div class="theme">“a cold grey overcast day with a few deer picking through sparse, grazed turf”</div>
+        <div class="theme">Cold overcast</div>
+        <details>
+          <summary>The brief it was built from</summary>
+          <blockquote>“a cold grey overcast day with a few deer picking through sparse, grazed turf”</blockquote>
+        </details>
         <div class="meta">6/6 layers accepted · every layer first attempt · 603 s</div>
         <a class="play" href="scenes/scene-003.html">Open scene →</a>
       </div>
