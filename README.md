@@ -18,7 +18,7 @@ docs/                        GitHub Pages root (served from main /docs)
   index.html                 landing page
   specialist-scenes/
     index.html               the write-up + gallery
-    worlds/*.cdn.html        seven hand-built reference worlds, each a single self-contained file
+    worlds/*.cdn.html        six hand-built reference worlds, each a single self-contained file
     scenes/*.html            four scenes composed by the specialist loop
     shots/                   stills used on the page
 ```
