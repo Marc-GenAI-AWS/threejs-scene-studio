@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Three.js Scene Studio — worlds written by small fine-tuned models</title>
+<style>
+  :root{ --bg:#0d1117; --panel:#161d26; --hair:#26323f; --ink:#e8eef4; --dim:#93a6b8; --accent:#c8a2ff; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg); color:var(--ink); font-family:"Inter","Segoe UI",system-ui,sans-serif; line-height:1.6;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:900px; margin:0 auto; padding:0 24px}
+  header{padding:96px 0 44px}
+  h1{font-size:42px; font-weight:680; letter-spacing:-.2px}
+  h1 .sub{display:block; font-size:17px; font-weight:400; color:var(--dim); margin-top:16px; max-width:70ch}
+  .cards{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:18px; padding:8px 0 56px}
+  a.card{display:block; background:var(--panel); border:1px solid var(--hair); border-radius:14px; padding:20px 22px;
+         text-decoration:none; color:inherit; transition:border-color .15s, background .15s}
+  a.card:hover{border-color:var(--accent); background:#1b2230}
+  a.card h2{font-size:17px; font-weight:640; margin-bottom:6px}
+  a.card p{font-size:14px; color:var(--dim)}
+  footer{padding:24px 0 80px; color:var(--dim); font-size:13px; border-top:1px solid var(--hair)}
+  footer a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Three.js Scene Studio
+    <span class="sub">Procedural real-time worlds where each layer is written by a small model fine-tuned on that one
+    layer, and a render harness — not a human, not an LLM judge — decides what ships.</span>
+  </h1>
+</header>
+
+<div class="cards">
+  <a class="card" href="specialist-scenes/">
+    <h2>Specialist scenes →</h2>
+    <p>Seven playable worlds, four generated scenes, what the specialists score, and the mistakes the verifier
+    taught us.</p>
+  </a>
+  <a class="card" href="https://github.com/Marc-GenAI-AWS/Recipes/tree/main/recipes/model-customization/procedural-scene-specialists">
+    <h2>The recipe →</h2>
+    <p>Full source: the golden scenes, the contract generator, the harness, and the training pipeline.</p>
+  </a>
+  <a class="card" href="https://marc-genai-aws.github.io/godot-game/specialist-scenes/">
+    <h2>The same idea in Godot →</h2>
+    <p>The sibling project: the same contract-and-verify recipe applied to Godot 4 scenes.</p>
+  </a>
+</div>
+
+<footer>
+  One verifier, three jobs: it filters the training data, scores the reward, and accepts the loop's output.
+</footer>
+
+</div>
+</body>
+</html>

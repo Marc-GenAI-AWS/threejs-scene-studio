@@ -1,0 +1,1178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Caldera — an active volcanic caldera, lit from the ground up</title>
+<meta name="states" content="dawn-ash,fissure-open,ashfall,night-glow" />
+<style>
+  :root { --ink: #e6f2f0; --ink-dim: rgba(230,242,240,.42); --ink-mid: rgba(230,242,240,.74); --hairline: rgba(230,242,240,.16); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #041418; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; color: var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #ui::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 220px; background: linear-gradient(transparent, rgba(2,10,14,.55)); z-index: -1; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 22px 28px; }
+  .mark { font-size: 12px; font-weight: 500; letter-spacing: .34em; text-shadow: 0 1px 8px rgba(0,0,0,.5); }
+  .mark small { letter-spacing: .2em; font-weight: 400; color: var(--ink-dim); margin-left: 1.2em; font-size: 10px; }
+  .hint { font-size: 10px; letter-spacing: .12em; color: var(--ink-dim); }
+  footer { padding: 0 28px 26px; max-width: 720px; }
+  #caption { font-family: Georgia, "Times New Roman", serif; font-style: italic; font-size: 18px; line-height: 1.45; color: var(--ink-mid);
+    text-shadow: 0 1px 10px rgba(0,0,0,.6); min-height: 2.9em; transition: opacity .6s; }
+  #caption.fade { opacity: 0; }
+  nav { display: flex; gap: 8px; margin-top: 16px; pointer-events: auto; flex-wrap: wrap; }
+  nav button { appearance: none; background: transparent; border: 1px solid var(--hairline); color: var(--ink-dim); font: inherit; font-size: 10px;
+    letter-spacing: .2em; text-transform: uppercase; padding: 8px 14px; border-radius: 16px; cursor: pointer; transition: all .4s; backdrop-filter: blur(6px); }
+  nav button:hover { color: var(--ink); border-color: rgba(230,242,240,.4); }
+  nav button.on { color: #061418; background: rgba(190, 232, 226, .9); border-color: transparent; }
+  @media (max-width: 560px) { #caption { font-size: 15px; } }
+</style>
+<script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="ui">
+  <header><div class="mark">CALDERA <small>GROUND LIGHT</small></div><div class="hint">#state in the URL selects a scene</div></header>
+  <footer><div id="caption"></div><nav id="nav"></nav></footer>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ---- ../contract/runtime.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE CONTRACT — shared runtime (v1)
+   The scene-agnostic engine every scene boots against. See SCENE_CONTRACT.md.
+   Provides: uniform helpers, a seeded RNG, a state machine (enumerated OR
+   factored manifest), and the assembler loop. A scene supplies a `sceneDef`
+   (uniforms, layer classes, camera, state resolver, per-frame apply) to boot().
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* uniform helpers — a ShaderMaterial's uniforms is uniformsFor({...locals}) */
+const F  = (v) => ({ value: v });
+const C3 = () => ({ value: new THREE.Color() });
+const V3 = (x = 0, y = 0, z = 0) => ({ value: new THREE.Vector3(x, y, z) });
+const uniformsFor = (U, extra = {}) => ({ ...U, ...extra });
+
+/* deterministic RNG (park–miller); no Math.random in scene code */
+function makeRNG(seed = 7) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  const rr = (a, b) => a + (b - a) * rnd();
+  return { rnd, rr };
+}
+
+/* cur → target exponential interpolation of every visual parameter.
+   `resolve(name)` returns a fresh target object (numbers, THREE.Color, THREE.Vector3).
+   Colors/Vectors lerp via .lerp; numbers lerp arithmetically. */
+class StateMachine {
+  constructor({ initial, resolve, rate = 1.2, onApply }) {
+    this.resolve = resolve; this.rate = rate; this.onApply = onApply;
+    this.cur = {}; this.target = {};
+    this.setState(initial, true);
+  }
+  setState(name, instant = false) {
+    const t = this.resolve(name);
+    for (const k in t) if (!(k in this.cur)) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+    this.target = t;
+    if (instant) for (const k in t) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+  }
+  tick(dt, t, ctx) {
+    const k = 1 - Math.exp(-dt * this.rate), cur = this.cur, tg = this.target;
+    for (const key in tg) {
+      const c = cur[key], target = tg[key];
+      if (typeof c === 'number') cur[key] = c + (target - c) * k;
+      else if (c && c.lerp) c.lerp(target, k);
+    }
+    if (this.onApply) this.onApply(cur, ctx, t);
+  }
+}
+
+/* boot the frozen skeleton: renderer, scene, camera, layers[], main loop.
+   sceneDef: { meta, buildUniforms(), resolveState(name), initialState(),
+               applyToUniforms(cur,ctx,t), layers:[Class], camera:Class,
+               postfx?:Class, setupUI?(ctx,sm), onHashChange?(sm) } */
+function boot(canvas, sceneDef) {
+  const meta = sceneDef.meta || {};
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, meta.pixelRatio ?? 2));
+  renderer.setSize(innerWidth, innerHeight);
+  if (meta.toneMapping && THREE[meta.toneMapping]) renderer.toneMapping = THREE[meta.toneMapping];
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(meta.fov ?? 55, innerWidth / innerHeight, meta.near ?? 0.5, meta.far ?? 10000);
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const { rnd, rr } = makeRNG(meta.seed ?? 7);
+  const U = sceneDef.buildUniforms();
+  const ctx = { THREE, renderer, scene, camera, U, rnd, rr, reducedMotion, cur: null };
+
+  const sm = new StateMachine({
+    initial: sceneDef.initialState(),
+    resolve: (name) => sceneDef.resolveState(name),
+    rate: meta.rate ?? 1.2,
+    onApply: (cur, c, t) => sceneDef.applyToUniforms(cur, c, t),
+  });
+  ctx.cur = sm.cur;
+
+  // scene-level setup (background, renderer tweaks) before layers are built
+  if (sceneDef.setup) sceneDef.setup(ctx);
+
+  const layers = (sceneDef.layers || []).map((L) => new L(ctx));
+  const rig = sceneDef.camera ? new sceneDef.camera(ctx) : null;
+  const post = sceneDef.postfx ? new sceneDef.postfx(ctx) : null;
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); if (post && post.resize) post.resize(innerWidth, innerHeight);
+  });
+  addEventListener('hashchange', () => sceneDef.onHashChange ? sceneDef.onHashChange(sm) : sm.setState(location.hash.slice(1)));
+  if (sceneDef.setupUI) sceneDef.setupUI(ctx, sm);
+
+  const clock = new THREE.Clock(); let t = 0;
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05); t += dt;
+    U.uTime.value = t;
+    sm.tick(dt, t, ctx);
+    if (rig) rig.update(dt, t, ctx);
+    for (const l of layers) if (l.update) l.update(dt, t);
+    if (post) post.render(); else renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+  return { ctx, sm, layers, rig, post };
+}
+
+// ---- field.js ----
+
+// Caldera geometry constants, the CPU mirror of the fissure network, and the
+// crust height field.
+//
+// The fissure network is ANALYTIC (pure sin/cos, no hashed noise), so the CPU
+// here and the GLSL in prelude.glsl.js agree to float precision. That matters
+// more in this world than in any other: the cracks are the light source, so
+// vent placement, ember emitters, moss avoidance and the camera all have to
+// land on the same seams the shader is setting on fire.
+
+const SPAN = 300;        // floor plate, x and z
+const BOWL = 118;        // radius of open floor before the wall climbs
+const RIM = 28;          // caldera wall height at the outer edge
+const PAN_Y = 0;         // nominal floor level
+
+// ---- CPU value noise (mirrors the GLSL vnz3/turb3 in form, not bit-for-bit) ----
+const hashK = (x, y, z) => { const s = Math.sin(x * 113.5 + y * 271.9 + z * 51.3) * 39718.4531; return s - Math.floor(s); };
+const mix1 = (a, b, t) => a + (b - a) * t;
+function vnzK(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  let xf = x - xi, yf = y - yi, zf = z - zi;
+  xf = xf * xf * (3 - 2 * xf); yf = yf * yf * (3 - 2 * yf); zf = zf * zf * (3 - 2 * zf);
+  const c = (dy, dz) => mix1(hashK(xi, yi + dy, zi + dz), hashK(xi + 1, yi + dy, zi + dz), xf);
+  return mix1(mix1(c(0, 0), c(1, 0), yf), mix1(c(0, 1), c(1, 1), yf), zf);
+}
+function turbK(x, y, z, o = 4) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < o; i++) { s += a * vnzK(x, y, z); x = x * 2.07 + 0.9; y = y * 1.93 + 2.3; z = z * 2.01 + 1.1; a *= 0.5; }
+  return s;
+}
+
+// ---- the fissure network (mirrored verbatim in prelude.glsl.js) ----
+// Two families of curved seams crossing at a shallow angle, the way a caldera
+// floor cracks as it sags. riftPhi is ~0 ON a seam; |riftPhi| grows away from it.
+const riftA = (x, z) =>
+  Math.sin(x * 0.245 + 1.70 * Math.sin(z * 0.095)) + 0.62 * Math.sin(z * 0.212 - 2.10 * Math.sin(x * 0.086));
+const riftB = (x, z) => {
+  const u = x * 0.62 + z * 0.78, v = x * 0.78 - z * 0.62;
+  return Math.sin(u * 0.330 + 1.40 * Math.sin(v * 0.117)) + 0.55 * Math.sin(v * 0.171 + 1.10 * Math.sin(u * 0.077));
+};
+// distance-to-nearest-seam, in phase units (~0.28 per world unit): the seam network
+// repeats every ~13 units, so the camera always has cracks in the near field.
+const riftPhi = (x, z) => Math.min(Math.abs(riftA(x, z)), Math.abs(riftB(x, z)) * 1.3);
+
+// domain: |x| <= SPAN/2, |z| <= SPAN/2; range: ~-1 in the seams, up to RIM on the wall.
+// Owned by Crust; sampled by Scorch/Plumes placement and the CameraRig.
+const crustH = (x, z) => {
+  const roll = 2.6 * (turbK(x * 0.011, 0, z * 0.011, 3) - 0.5) + 0.85 * (turbK(x * 0.058, 4, z * 0.058, 2) - 0.5);
+  const seam = -1.15 * Math.max(0, 1 - riftPhi(x, z) / 0.95);    // the cracks are sunken trenches
+  let h = PAN_Y + roll + seam;
+  const d = Math.hypot(x, z) - BOWL;
+  if (d > 0) {
+    const climb = Math.min(1, d / 38) ** 0.78;
+    const benches = 2.6 * Math.sin(d * 0.34 + 6.0 * turbK(x * 0.02, 7, z * 0.02, 2));
+    h += RIM * climb + benches * Math.min(1, d / 9);
+  }
+  return h;
+};
+
+// cool enough for anything to grow: away from every seam and off the bare pan.
+const coolAt = (x, z) => riftPhi(x, z);
+const onFloor = (x, z) => Math.hypot(x, z) < BOWL - 3;
+
+const UP = new THREE.Vector3(0, 1, 0);
+
+// ---- prelude.glsl.js ----
+
+// Caldera GLSL prelude.
+//
+// G = core noise + this world's fields. VERT_WORLD / FRAG_CRUST are the bases
+// every solid material derives from by string-surgery. TAIL closes main().
+//
+// The distinctive field here is fireLight(): in a caldera the light comes UP off
+// the floor. Faces that point DOWN are the lit ones, vertical faces catch the
+// grazing spill, and up-facing tops are the darkest part of any object. Anything
+// shaded with a conventional sky-over-ground model reads as if it were pasted in
+// from a different world — which, in this set, it would have been.
+
+const G = /* glsl */`
+uniform float uTime;
+uniform vec3 uAshC; uniform float uAshD, uAshFall;
+uniform vec3 uVaultC; uniform float uVaultI;
+uniform vec3 uPaleDir, uPaleC; uniform float uPaleI;
+uniform vec3 uLavaC, uCrustC, uSulphC;
+uniform float uCrackI, uCrackW, uFireI, uGlowH, uWarp;
+uniform float uSteamI, uSparkI, uScorch, uStarI, uBowlR, uRimY;
+uniform vec2 uGust;
+
+float hashV(vec3 p){ return fract(sin(dot(p, vec3(113.5, 271.9, 51.3))) * 39718.4531); }
+vec2 hash2V(vec2 p){ return fract(sin(vec2(dot(p, vec2(113.5, 271.9)), dot(p, vec2(197.3, 83.1)))) * 39718.4531); }
+float vnz3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hashV(i), hashV(i+vec3(1,0,0)), f.x), mix(hashV(i+vec3(0,1,0)), hashV(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(hashV(i+vec3(0,0,1)), hashV(i+vec3(1,0,1)), f.x), mix(hashV(i+vec3(0,1,1)), hashV(i+vec3(1,1,1)), f.x), f.y), f.z); }
+const mat3 TUMBLE = mat3(0.60, 0.48, -0.64, -0.64, 0.75, 0.16, 0.48, 0.45, 0.75);
+float turb3(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * vnz3(p); p = TUMBLE * p * 2.07 + 1.3; a *= 0.5; } return s; }
+float turb2(vec2 p){ return turb3(vec3(p, 0.61)); }
+
+/* ── the fissure network. Mirrored exactly in field.js so the CPU and the GPU
+      put the cracks in the same places. riftPhi ~ 0 means "on a seam". ── */
+float riftA(vec2 q){ return sin(q.x*0.245 + 1.70*sin(q.y*0.095)) + 0.62*sin(q.y*0.212 - 2.10*sin(q.x*0.086)); }
+float riftB(vec2 q){ float u = q.x*0.62 + q.y*0.78, v = q.x*0.78 - q.y*0.62;
+  return sin(u*0.330 + 1.40*sin(v*0.117)) + 0.55*sin(v*0.171 + 1.10*sin(u*0.077)); }
+float riftPhi(vec2 q){ return min(abs(riftA(q)), abs(riftB(q))*1.3); }
+
+/* the seam distance the emission and the irradiance both key off, with the phase
+   meandered and frayed by noise so no crack is a drawn curve. Factored out so
+   crackAmt() and crackGlow() can never drift apart. */
+float seamD(vec2 q){ return riftPhi(q) + 0.26*(turb2(q*0.11) - 0.5) + 0.10*(turb2(q*0.62) - 0.5); }
+
+/* not every seam is live. A slow field over the pan leaves whole quarters crusted
+   over and black while others run open, so the network reads as cooling rock with
+   fire in it rather than as a lit wireframe laid over a plane. */
+float heatAt(vec2 q){ return 0.16 + 0.84*smoothstep(0.30, 0.72, turb2(q*0.016 + 21.0)); }
+
+/* only the sunken pan is cracked; the caldera wall is cold rock. */
+float panMask(vec2 q){ return smoothstep(uBowlR*1.02, uBowlR*0.78, length(q)); }
+
+/* how molten the floor is at q: 1 in the open seam, 0 on cold crust. Breathes,
+   because a fissure is a convecting slot and not a neon strip. */
+float crackAmt(vec2 q){
+  float d = seamD(q);
+  float breath = 0.68 + 0.32*sin(uTime*0.55 + q.x*0.048 + q.y*0.031);
+  return smoothstep(uCrackW, 0.0, d) * breath * heatAt(q) * panMask(q);
+}
+
+/* the emissive colour of the floor at q: white-hot in the seam, cooling out
+   through the crust shoulders. This is the whole world's light source. */
+vec3 crackGlow(vec2 q){
+  float d = seamD(q);
+  float core = smoothstep(uCrackW, 0.0, d);
+  /* chilled crust rafts floating on the melt: without them a seam is a neon tube */
+  core *= mix(0.16, 1.0, smoothstep(0.32, 0.60, turb2(q*0.85 + 13.0)));
+  float shoulder = smoothstep(uCrackW*3.5, uCrackW*0.5, d);
+  float churn = clamp(0.40 + 1.05*turb2(q*0.55 + vec2(0.0, uTime*0.22)), 0.35, 1.25);
+  vec3 hot = mix(uLavaC, vec3(1.0, 0.88, 0.60), smoothstep(0.80, 1.35, core*churn));
+  return uCrackI * panMask(q) * heatAt(q) * (hot*core*churn*0.90 + uLavaC*shoulder*0.055);
+}
+
+/* ── THE INVERSION ──
+   Irradiance arriving from the GROUND. Sampled at a few lateral offsets so a
+   point is lit by the seams around it, not only the one under it; falls off
+   with height; and weighted so DOWN-facing surfaces are the bright ones and
+   flat tops the dark ones. Shadows in this world run upward. */
+vec3 fireLight(vec3 p, vec3 n){
+  float a = crackAmt(p.xz)
+          + 0.60*crackAmt(p.xz + vec2( 7.0,  3.0))
+          + 0.55*crackAmt(p.xz + vec2(-4.0,  8.0))
+          + 0.35*crackAmt(p.xz + vec2(-12.0,-14.0))
+          + 0.35*crackAmt(p.xz + vec2(15.0, -9.0));
+  a = min(a, 1.7);
+  float h = max(p.y, 0.0);
+  float fall = 1.0 / (1.0 + (h*h) / (uGlowH*uGlowH));
+  float facing = 0.30 + 0.85*max(-n.y, 0.0) + 0.45*(1.0 - abs(n.y));
+  /* the whole pan acts as one broad source, so the caldera wall is lit at its foot
+     and goes to soot toward the rim — reach well past uBowlR or the wall is a hole */
+  float wide = smoothstep(uBowlR*1.85, uBowlR*0.55, length(p.xz));
+  return uLavaC * uFireI * (0.16 + a) * fall * facing * wide;
+}
+
+/* the only light from above: ash-filtered day, or starlight. Never dominant —
+   in every state it is a fraction of what the floor is throwing up. */
+vec3 vaultLight(vec3 n){
+  return uVaultC * uVaultI * 2.1 * (0.22 + 0.78*max(n.y, 0.0))
+       + uPaleC * uPaleI * max(dot(n, -uPaleDir), 0.0);
+}
+
+/* sulphur bloom: sharp-edged yellow crusts that gather on cool rock beside the
+   seams, where the gas condenses. Never inside a seam. */
+float sulphur(vec3 p){
+  float band = smoothstep(0.46, 0.92, turb2(p.xz*0.085 + 4.3));
+  float near = smoothstep(0.85, 0.22, riftPhi(p.xz));
+  return band * near * smoothstep(0.28, 0.78, turb3(p*0.9)) * panMask(p.xz);
+}
+
+/* ash + steam. The medium itself glows near the floor, because the fissures are
+   lighting it from inside — so distance does not fade to grey here, it fades to
+   a dull orange down low and to soot up high. */
+vec3 ashVeil(vec3 col, vec3 p){
+  float d = distance(p, cameraPosition);
+  float k = uAshD * (1.0 + 1.4*uAshFall);
+  float f = 1.0 - exp(-d*d*k*k);
+  float lowGlow = exp(-max(p.y, 0.0) / max(uGlowH*1.4, 1.0)) * uCrackI;
+  vec3 med = mix(uAshC, uLavaC*0.32, clamp(0.45*lowGlow, 0.0, 0.55));
+  return mix(col, med, clamp(f, 0.0, 1.0));
+}
+float ashAtt(vec3 p){ float d = distance(p, cameraPosition);
+  float k = uAshD * (1.0 + 1.4*uAshFall); return exp(-d*d*k*k); }
+
+/* convection shimmer over the hot ground: a small uv/normal nudge that rises
+   with the heat, so the crust boils a little where the seams are open. */
+vec2 heatWarp(vec3 p){
+  float h = crackAmt(p.xz) * uWarp * exp(-max(p.y, 0.0)/6.0);
+  return h * vec2(turb2(p.xz*0.45 + uTime*0.75) - 0.5, turb2(p.zx*0.45 - uTime*0.62) - 0.5);
+}
+
+/* how much ember a point in the air is carrying — drives the spark layer and
+   the glow on anything hanging over an open seam. */
+float emberAt(vec3 p){
+  return crackAmt(p.xz) * uSparkI * exp(-max(p.y, 0.0) / (uGlowH*1.8));
+}
+
+/* the caldera draws its own wind: hot air off the pan, cold off the rim. */
+vec2 gustAt(vec3 p){ return uGust * (0.55 + 0.9*turb2(p.xz*0.028 + uTime*0.045)); }
+`;
+
+const VERT_WORLD = /* glsl */`
+varying vec3 vP, vN; uniform float uBend; uniform float uTime; uniform vec2 uGust;
+void main(){
+  #ifdef USE_INSTANCING
+  mat4 m = modelMatrix * instanceMatrix;
+  #else
+  mat4 m = modelMatrix;
+  #endif
+  vec4 wp = m * vec4(position, 1.0);
+  if (uBend > 0.0) { float s = clamp(wp.y * 0.55, 0.0, 1.0); s *= s;
+    wp.xz += uBend * s * (uGust * 0.9 + vec2(sin(uTime*1.9 + wp.z*0.6), cos(uTime*1.5 + wp.x*0.7)) * 0.28); }
+  vP = wp.xyz; vN = normalize(mat3(m) * normal); gl_Position = projectionMatrix * viewMatrix * wp; }`;
+
+const FRAG_CRUST = G + /* glsl */`
+varying vec3 vP, vN; uniform vec3 uBaseC; uniform float uRough;
+void main(){
+  vec3 p = vP;
+  vec2 hw = heatWarp(p);
+  vec3 n = normalize(normalize(vN)
+    + vec3(hw.x, 0.0, hw.y) * 1.4
+    + 0.38 * vec3(vnz3(p*0.55 + 1.0) - 0.5, vnz3(p*0.55 + 2.0) - 0.5, vnz3(p*0.55 + 3.0) - 0.5)
+    + 0.26 * vec3(vnz3(p*2.1 + 1.0) - 0.5, vnz3(p*2.1 + 2.0) - 0.5, vnz3(p*2.1 + 3.0) - 0.5)
+    + 0.10 * vec3(vnz3(p*7.0) - 0.5, vnz3(p*7.0 + 4.0) - 0.5, vnz3(p*7.0 + 8.0) - 0.5));
+
+  float m = turb3(p*0.26), m2 = turb3(p*1.45 + 9.0);
+  vec3 base = uBaseC * uCrustC * (1.0 - uRough*0.4 + uRough*0.95*m) * (0.80 + 0.30*m2);
+
+  /* obsidian: glassy sheets on the ropy pahoehoe, near-black but mirror-bright
+     where the seam light grazes them */
+  float glass = smoothstep(0.60, 0.92, turb3(p*0.16 + 3.0));
+  base = mix(base, base*0.28 + vec3(0.03, 0.03, 0.045), glass*0.72);
+
+  /* sulphur crusts at the cool shoulders */
+  float su = sulphur(p);
+  base = mix(base, uSulphC, su*0.85);
+
+  vec3 light = fireLight(p, n) + vaultLight(n);
+  vec3 col = base * light;
+
+  /* a sharp specular off the glassy crust, from the seams below */
+  vec3 v = normalize(cameraPosition - p);
+  float graze = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+  col += uLavaC * uCrackI * glass * graze * 0.35 * crackAmt(p.xz + vec2(3.0, -2.0));
+
+  /* the caldera's own shadow, cast UPWARD: the wall goes to soot above the line
+     the seam light can reach, which is where an ordinary world would be brightest */
+  col *= mix(1.0, 0.55, smoothstep(2.0, uRimY*0.75, p.y));
+
+  /* and the seams themselves, emitting */
+  col += crackGlow(p.xz) * (1.0 - 0.55*su);
+
+  gl_FragColor = vec4(ashVeil(col, p), 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+const TAIL = /* glsl */`
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+// ---- materials.js ----
+
+// Material factories built by string-surgery on the shared bases. Reach for these
+// before writing a raw ShaderMaterial: they carry fireLight(), the sulphur crusts
+// and the ash veil, so a mesh stands IN the caldera — lit from below, dark on top —
+// instead of beside it wearing ordinary daylight.
+
+const crustMat = (ctx, base, opts = {}) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, {
+    uBaseC: { value: new THREE.Color(...base) },
+    uRough: F(opts.rough ?? 1),
+    uBend: F(opts.bend ?? 0),
+  }),
+  vertexShader: VERT_WORLD, fragmentShader: FRAG_CRUST, side: opts.side ?? THREE.FrontSide,
+});
+
+// Scorch: crust shading plus a per-instance tint and a scorch wash, so what little
+// grows here answers the state's `scorch` the way the rock answers `crackI`.
+const VERT_SCORCH = VERT_WORLD
+  .replace('varying vec3 vP, vN;', 'varying vec3 vP, vN, vTint; varying vec2 vUv; attribute vec3 aTint;')
+  .replace('vP = wp.xyz;', 'vP = wp.xyz; vTint = aTint; vUv = uv;');
+
+// A quad is a rectangle; a wind-burnt tussock is not. Carve the silhouette out of
+// the quad with an alpha discard — splayed at the base, eaten away toward the tip —
+// or the scrub reads as coloured cardboard propped on the ash, and worse here than
+// anywhere, because every blade is backlit by the seams behind it.
+const FRAG_SCORCH = FRAG_CRUST
+  .replace('varying vec3 vP, vN; uniform vec3 uBaseC; uniform float uRough;',
+           'varying vec3 vP, vN, vTint; varying vec2 vUv; uniform vec3 uBaseC; uniform float uRough;')
+  .replace('void main(){\n  vec3 p = vP;', `void main(){
+  vec3 p = vP;
+  /* per-clump offset so neighbouring instances are not the same silhouette */
+  vec2 co = floor(p.xz * 2.7);
+  float rad = abs(vUv.x - 0.5) * 2.0;
+  float y = clamp(vUv.y, 0.0, 1.0);
+  /* splayed tussock: wide and shaggy at the base, thinning to separated blades */
+  float splay = (1.0 - pow(y, 0.72)) * (0.55 + 0.55*turb2(vec2(y*4.0, 0.0) + co))
+              + 0.20*sin(y*13.0 + turb2(co)*6.28);
+  float bite = 0.50 + 0.85*turb2(vec2(vUv.x*18.0, y*24.0) + co*3.7);
+  if (rad > splay * bite) discard;
+  if (turb2(vec2(vUv.x*30.0, y*38.0) + co*8.3) < 0.42 + 0.16*y) discard;   /* open it into blades */`)
+  .replace('vec3 base = uBaseC * uCrustC * (1.0 - uRough*0.4 + uRough*0.95*m) * (0.80 + 0.30*m2);',
+           `vec3 base = mix(vTint, vec3(0.30, 0.26, 0.22), uScorch*0.85)
+              * (0.72 + 0.55*vnz3(p*12.0)) * (0.55 + 0.45*(1.0 - y));`)
+  .replace('float glass = smoothstep(0.60, 0.92, turb3(p*0.16 + 3.0));', 'float glass = 0.0;')
+  .replace('float su = sulphur(p);', 'float su = sulphur(p) * 0.4;');
+
+const scorchMat = (ctx) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, { uBaseC: C3(), uRough: F(0.35), uBend: F(1) }),
+  vertexShader: VERT_SCORCH, fragmentShader: FRAG_SCORCH, side: THREE.DoubleSide,
+});
+
+// ---- layers/crust.js ----
+
+/* ═══ COMPONENT: Crust (the ground) ═══
+   The caldera floor and the wall that rises out of it, in one mesh. Every vertex's
+   y comes from crustH(x, z) — the shared height field the scrub, the vents and the
+   camera all sample, so nothing floats or sinks.
+
+   This is the layer that carries the world's signature. The fissures are modelled
+   twice over: as GEOMETRY (crustH digs a trench along every seam, so the crust has
+   a lip that catches its own light) and as EMISSION (crackGlow paints the molten
+   floor of the trench). Remove this layer and the scene has no light source at all,
+   which is the point — everything else in the caldera is lit by what happens here.
+
+   The tessellation is deliberately fine: at 240x240 the seam trenches are 3-4 quads
+   wide, which is the minimum that keeps them reading as cut channels rather than as
+   a glowing decal painted on a flat plate. */
+class Crust {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const g = new THREE.PlaneGeometry(SPAN, SPAN, 240, 240);
+    g.rotateX(-Math.PI / 2);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) pos.setY(i, crustH(pos.getX(i), pos.getZ(i)));
+    pos.needsUpdate = true;
+    g.computeVertexNormals();
+
+    this.mesh = new THREE.Mesh(g, crustMat(ctx, [0.21, 0.170, 0.155], { rough: 1.0 }));
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+
+    // a handful of spatter cones straddling the hottest seams: low, steep, and lit
+    // hard on their inward faces, which is what makes the floor read as a floor.
+    const cones = coneField(ctx);
+    if (cones) {
+      this.cones = new THREE.Mesh(cones, crustMat(ctx, [0.18, 0.135, 0.125], { rough: 0.8 }));
+      this.cones.frustumCulled = false;
+      ctx.scene.add(this.cones);
+    }
+  }
+  update() { /* static geometry; all state response lives in the shared uniforms */ }
+}
+
+/* merged cone geometry, built by hand — BufferGeometryUtils may not be in the
+   assembled bundle, so nothing here may depend on it. */
+function coneField(ctx) {
+  const { rr } = ctx;
+  const pos = [], idx = [];
+  const SEG = 9, N = 26;
+  for (let c = 0; c < N; c++) {
+    const a = rr(0, Math.PI * 2), r = rr(30, BOWL - 14);
+    const cx = Math.cos(a) * r, cz = Math.sin(a) * r;
+    const base = crustH(cx, cz), rad = rr(2.4, 6.0), hgt = rr(1.4, 3.8);
+    const o = pos.length / 3;
+    pos.push(cx, base + hgt, cz);                                  // apex
+    for (let s = 0; s < SEG; s++) {
+      const t = (s / SEG) * Math.PI * 2, wob = 0.75 + 0.5 * Math.sin(t * 3 + a);
+      const bx = cx + Math.cos(t) * rad * wob, bz = cz + Math.sin(t) * rad * wob;
+      pos.push(bx, crustH(bx, bz) - 0.3, bz);
+    }
+    for (let s = 0; s < SEG; s++) idx.push(o, o + 1 + ((s + 1) % SEG), o + 1 + s);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+// ---- layers/vault.js ----
+
+/* ═══ COMPONENT: Vault (the sky) ═══
+   An ash pall over the caldera, and the darkest thing in frame in every state —
+   which is the inversion this world exists for. It is not a light source; it is a
+   lid. What brightness it has is BORROWED: the underside of the pall catches the
+   orange coming up off the fissures, so the sky is brightest at the horizon and
+   goes to soot at the zenith, exactly backwards from an open sky.
+
+   Two features carry it. The ember band: an exponential lamp-from-below falloff in
+   d.y, tinted by uLavaC and scaled by uCrackI, so opening the fissures visibly
+   lights the cloud base. And the ash column: a single standing plume over the main
+   vent, warm and churning at its foot, grey and shredded where it tops out. Stars
+   only survive at the zenith, and only when uAshD lets them. */
+class Vault {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const geo = new THREE.SphereGeometry(700, 44, 30);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, fog: false,
+      uniforms: uniformsFor(ctx.U, {}),
+      vertexShader: `varying vec3 vDir;
+        void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        float up = d.y;
+
+        /* the pall itself: soot at the zenith, a shade warmer and denser low down */
+        float lid = 0.45 + 0.55 * smoothstep(0.85, -0.25, up);
+        vec2 q = d.xz / max(up + 0.42, 0.14);                   /* project onto the cloud base */
+        float churn = turb2(q * 0.55 + vec2(uTime * 0.012, uTime * 0.008));
+        vec3 col = uVaultC * uVaultI * lid * (0.55 + 0.95 * churn);
+
+        /* THE INVERSION: the cloud base is lit from underneath by the floor */
+        float lamp = exp(-max(up, -0.2) * 3.2);
+        col += uLavaC * uCrackI * 0.045 * lamp * (0.35 + 1.15 * churn);
+
+        /* the ash column standing over the main vent field */
+        vec2 cd = normalize(vec2(0.52, -0.855));
+        float aim = smoothstep(0.74, 0.995, dot(normalize(d.xz + vec2(1e-4)), cd));
+        float shred = turb3(vec3(q * 1.6, uTime * 0.035));
+        float plume = aim * smoothstep(-0.08, 0.30, up) * exp(-max(up, 0.0) * 1.15) * (0.25 + 1.3 * shred);
+        col += mix(uLavaC * 0.42, uAshC, smoothstep(0.02, 0.42, up)) * plume * 0.16 * (0.28 + 0.9 * uCrackI);
+
+        /* ash-filtered daylight, if the state has any: a diffuse smear, no disc */
+        float pd = max(dot(d, -uPaleDir), 0.0);
+        col += uPaleC * uPaleI * (0.05 + 0.50 * pow(pd, 6.0)) * smoothstep(-0.12, 0.6, up);
+
+        /* almost no stars: only at the zenith, and only through thin ash */
+        if (uStarI > 0.001) {
+          vec3 sp = d * 110.0;
+          float tw = vnz3(floor(sp) + 0.5);
+          float st = step(0.9982, hashV(floor(sp))) * (0.5 + 0.5 * sin(uTime * 1.7 + tw * 28.0));
+          col += vec3(0.72, 0.78, 0.95) * st * uStarI * smoothstep(0.42, 0.95, up) * exp(-uAshD * 140.0);
+        }
+
+        /* heavy ashfall closes the lid completely */
+        col = mix(col, uAshC * (0.55 + 0.50 * churn) * (0.62 + 0.38 * lamp), uAshFall * 0.78);
+        gl_FragColor = vec4(col, 1.0);
+      ` + TAIL,
+    });
+    this.mesh = new THREE.Mesh(geo, mat);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+  }
+  update() { this.mesh.position.copy(this.ctx.camera.position); }
+}
+
+// ---- layers/scorch.js ----
+
+/* ═══ COMPONENT: Scorch (the vegetation) ═══
+   Almost nothing lives here, and the layer is honest about it: two sparse
+   populations, both keyed off coolAt() so nothing is ever growing in a seam.
+
+   Tussocks — wind-burnt scrub, only where the crust has been cold long enough,
+   clustered in the lee of old spatter so a few clumps read instead of an even
+   sprinkle. Moss mats — sulphur-tolerant crusts, flattened almost to the ground,
+   pushed out to the cool margins near the wall foot.
+
+   Both are backlit rather than lit: the seams are BEHIND and BELOW them, so what
+   the camera sees is mostly silhouette with an orange rim on the underside of each
+   blade. That only works if the silhouette is real, hence the alpha discard in
+   FRAG_SCORCH — an undiscarded quad here reads as a rectangle of cardboard lit
+   from the wrong side, which is worse than nothing.
+
+   InstancedMesh, not InstancedBufferGeometry: only InstancedMesh makes three.js
+   define USE_INSTANCING, which VERT_WORLD needs to see instanceMatrix at all. */
+class Scorch {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.tuss = this.sow(ctx, 340, {
+      rMin: 30, rMax: BOWL - 6, cool: 0.78, clump: 5,
+      hMin: 0.75, hMax: 2.05, flat: 1.0,
+      tint: (d) => [0.15 + 0.13 * d, 0.145 + 0.010 * d, 0.085 + 0.020 * d],
+    });
+    this.moss = this.sow(ctx, 260, {
+      rMin: 58, rMax: BOWL + 14, cool: 0.62, clump: 8,
+      hMin: 0.12, hMax: 0.26, flat: 4.2,
+      tint: (d) => [0.15 + 0.10 * d, 0.24 + 0.08 * d, 0.11 + 0.04 * d],
+    });
+  }
+
+  sow(ctx, N, o) {
+    const { rr, rnd } = ctx;
+    const geo = crossedBlades();
+    const mesh = new THREE.InstancedMesh(geo, scorchMat(ctx), N);
+    mesh.frustumCulled = false;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    const tints = new Float32Array(N * 3);
+    let n = 0, guard = 0, cx = 0, cz = 0, left = 0;
+    while (n < N && guard++ < N * 60) {
+      if (left <= 0) {                                   // pick a new clump centre
+        const a = rr(0, Math.PI * 2), r = rr(o.rMin, o.rMax);
+        cx = Math.cos(a) * r; cz = Math.sin(a) * r;
+        if (coolAt(cx, cz) < o.cool) continue;
+        left = 1 + Math.floor(rnd() * o.clump);
+      }
+      const x = cx + rr(-3.2, 3.2), z = cz + rr(-3.2, 3.2);
+      left--;
+      if (Math.hypot(x, z) > o.rMax + 5) continue;
+      if (coolAt(x, z) < o.cool * 0.82) continue;
+      const h = rr(o.hMin, o.hMax);
+      p.set(x, crustH(x, z) - 0.06, z);
+      q.setFromAxisAngle(up, rr(0, Math.PI * 2));
+      s.set(h * o.flat * rr(0.7, 1.3), h, h * o.flat * rr(0.7, 1.3));
+      mesh.setMatrixAt(n, m.compose(p, q, s));
+      const d = rr(0, 1), t = o.tint(d);
+      tints[n * 3] = t[0]; tints[n * 3 + 1] = t[1]; tints[n * 3 + 2] = t[2];
+      n++;
+    }
+    mesh.count = n;
+    mesh.instanceMatrix.needsUpdate = true;
+    geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(tints, 3));
+    ctx.scene.add(mesh);
+    return mesh;
+  }
+
+  update() { /* bend is driven by uGust/uTime inside VERT_SCORCH */ }
+}
+
+/* three blades crossed about the vertical, built explicitly so there is no
+   dependency on BufferGeometryUtils being present in the assembled bundle. */
+function crossedBlades() {
+  const g = new THREE.BufferGeometry();
+  const pos = [], nor = [], uv = [], idx = [];
+  for (let k = 0; k < 3; k++) {
+    const a = (k / 3) * Math.PI, ax = Math.cos(a), az = Math.sin(a), o = k * 4;
+    pos.push(-0.5 * ax, 0, -0.5 * az, 0.5 * ax, 0, 0.5 * az, 0.5 * ax, 1, 0.5 * az, -0.5 * ax, 1, -0.5 * az);
+    for (let i = 0; i < 4; i++) nor.push(-az, 0.3, ax);
+    uv.push(0, 0, 1, 0, 1, 1, 0, 1);
+    idx.push(o, o + 1, o + 2, o, o + 2, o + 3);
+  }
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return g;
+}
+
+// ---- layers/skein.js ----
+
+/* ═══ COMPONENT: Skein (the fauna) ═══
+   Almost nothing crosses a live caldera, and this layer does not pretend otherwise:
+   nine big soarers, high up, riding the thermal that stands over the hot pan — and
+   circling wide of the vents, because the column over a vent is ash, not lift.
+
+   The reason they are worth drawing at all is that they are the one thing in frame
+   that shows what the light is doing. A bird over a lit floor is not a silhouette:
+   its UNDERSIDE is the lit face and its back is the dark one, so each one reads as
+   a small orange chevron with a black spine. Get that backwards and the whole
+   lighting claim of the world collapses in the only place the eye can check it.
+
+   Scale: ~4 units of wingspan seen from 40-90 units away. Smaller and they are
+   sensor noise; larger and the caldera stops being 240 units across. */
+class Skein {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr } = ctx;
+    const N = 12;
+    this.birds = [];
+    for (let i = 0; i < N; i++) {
+      const ca = rr(0, Math.PI * 2), cr = rr(56, BOWL - 14);
+      this.birds.push({
+        cx: Math.cos(ca) * cr, cz: Math.sin(ca) * cr,
+        r: rr(14, 30), y: rr(22, 48),
+        w: rr(0.09, 0.19) * (rr(0, 1) < 0.5 ? -1 : 1),
+        ph: rr(0, Math.PI * 2), flap: rr(0.5, 1.1), span: rr(1.1, 1.8),
+      });
+    }
+    this.mesh = new THREE.InstancedMesh(soarerGeometry(), skeinMat(ctx), N);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+
+    this.m = new THREE.Matrix4(); this.q = new THREE.Quaternion();
+    this.p = new THREE.Vector3(); this.s = new THREE.Vector3(); this.e = new THREE.Euler();
+  }
+
+  update(dt, t) {
+    const { m, q, p, s, e } = this;
+    const rate = this.ctx.cur ? (this.ctx.cur.birdRate ?? 1) : 1;
+    for (let i = 0; i < this.birds.length; i++) {
+      const b = this.birds[i];
+      const a = b.ph + t * b.w * rate;
+      p.set(b.cx + Math.cos(a) * b.r, b.y + 2.6 * Math.sin(t * 0.17 * rate + b.ph), b.cz + Math.sin(a) * b.r);
+      const heading = a + (b.w > 0 ? Math.PI / 2 : -Math.PI / 2);
+      e.set(0.10 * Math.sin(t * b.flap * rate + b.ph), heading, b.w > 0 ? -0.36 : 0.36, 'YXZ');
+      q.setFromEuler(e);
+      s.setScalar(b.span);
+      this.mesh.setMatrixAt(i, m.compose(p, q, s));
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+/* a flat delta with a dihedral kink, so the two wing halves take the seam light at
+   slightly different angles and the bird does not flatten into one orange dash. */
+function soarerGeometry() {
+  const g = new THREE.BufferGeometry();
+  const pos = [
+    0, 0, -0.62, 0, 0, 0.52,               // 0,1 head / tail
+    -0.34, 0.05, -0.05, -0.95, 0.13, 0.30, // 2,3 left inner / swept tip
+    0.34, 0.05, -0.05, 0.95, 0.13, 0.30,   // 4,5 right inner / swept tip
+  ];
+  const idx = [0, 2, 1, 2, 3, 1, 0, 1, 4, 1, 5, 4];
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+const skeinMat = (ctx) => new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: uniformsFor(ctx.U, { uSoarC: F(new THREE.Color(0.105, 0.090, 0.085)) }),
+  vertexShader: /* glsl */`
+    varying vec3 vP, vN;
+    void main(){
+      #ifdef USE_INSTANCING
+      mat4 m = modelMatrix * instanceMatrix;
+      #else
+      mat4 m = modelMatrix;
+      #endif
+      vec4 wp = m * vec4(position, 1.0);
+      vP = wp.xyz; vN = normalize(mat3(m) * normal);
+      gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: G + /* glsl */`
+    varying vec3 vP, vN; uniform vec3 uSoarC;
+    void main(){
+      /* a soarer is a thin plate: orient the normal toward the eye so the face we
+         can actually see is the one that gets shaded, then let fireLight() decide.
+         Seen from the pan that is the UNDERSIDE, and it comes up orange. */
+      vec3 n = normalize(vN);
+      if (dot(n, normalize(cameraPosition - vP)) < 0.0) n = -n;
+      vec3 col = uSoarC * (0.10 + 3.6 * fireLight(vP, n)) + uSoarC * vaultLight(n) * 0.9;
+      col += uLavaC * uCrackI * 0.16 * max(-n.y, 0.0);      /* seam rim on the leading edge */
+      gl_FragColor = vec4(ashVeil(col, vP), 1.0);
+    ` + TAIL,
+});
+
+// ---- layers/plumes.js ----
+
+/* ═══ COMPONENT: Plumes (the effects) ═══
+   Three populations, all of them emitters or receivers of the floor's light.
+
+   Steam — standing columns over the vents. Seeded on the CPU at points where
+   riftPhi says there really is a seam, so no plume rises out of cold rock. Each
+   puff is shaded by fireLight() with a DOWNWARD normal: it is a body of vapour
+   with a lit underside, so the column is orange at its foot and goes grey-white
+   as it climbs out of the glow. That gradient is the single clearest read of
+   "lit from below" anywhere in the frame.
+
+   Ashfall — fine grit coming down, wrapped in a box around the pan. Dark against
+   the wall, and picked out warm when it falls past a seam.
+
+   Embers — spark rising off the open cracks, additive and short-lived, keyed to
+   emberAt() so they only exist where the fissure is actually open. They are the
+   only thing in the world with genuinely random-looking motion, so they do most
+   of the work of making the caldera feel alive rather than painted. */
+class Plumes {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.steam = this.buildSteam(ctx);
+    this.ash = this.buildAsh(ctx);
+    this.embers = this.buildEmbers(ctx);
+  }
+
+  // find N points that really sit in a seam, using the shared CPU field
+  seamPoints(ctx, n, tol) {
+    const { rr } = ctx, out = [];
+    let guard = 0;
+    while (out.length < n && guard++ < n * 400) {
+      const a = rr(0, Math.PI * 2), r = rr(14, BOWL - 14);
+      const x = Math.cos(a) * r, z = Math.sin(a) * r;
+      if (riftPhi(x, z) > tol) continue;
+      out.push([x, crustH(x, z), z]);
+    }
+    while (out.length < n) out.push([0, crustH(0, 0), 0]);
+    return out;
+  }
+
+  buildSteam(ctx) {
+    const { rr } = ctx, N = 2600;
+    const vents = this.seamPoints(ctx, 11, 0.14);
+    const p = new Float32Array(N * 3), seed = new Float32Array(N), size = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const v = vents[i % vents.length];
+      p[i * 3] = v[0] + rr(-1.8, 1.8); p[i * 3 + 1] = v[1] + rr(-0.3, 0.6); p[i * 3 + 2] = v[2] + rr(-1.8, 1.8);
+      seed[i] = rr(0, 1); size[i] = rr(0.55, 1.25);
+    }
+    const g = pointGeo(p, seed, size);
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.NormalBlending,
+      uniforms: uniformsFor(ctx.U, { uPlumeH: F(26) }),
+      vertexShader: G + /* glsl */`
+        attribute float aSeed, aSize; varying float vLife; varying vec3 vQ;
+        uniform float uPlumeH;
+        void main(){
+          float sp = 0.055 + 0.055 * fract(aSeed * 7.13);
+          float life = fract(uTime * sp + aSeed);
+          vec3 q = position;
+          float rise = life * uPlumeH;
+          q.y += rise;
+          float spread = 0.9 + 7.5 * life;
+          q.x += spread * (turb2(vec2(aSeed * 91.0, life * 3.0)) - 0.5) * 2.0 + gustAt(q).x * rise * 0.09;
+          q.z += spread * (turb2(vec2(aSeed * 37.0 + 5.0, life * 3.0)) - 0.5) * 2.0 + gustAt(q).y * rise * 0.09;
+          vLife = life; vQ = q;
+          vec4 mv = viewMatrix * vec4(q, 1.0);
+          gl_PointSize = (3.0 + 15.0 * life) * aSize * (58.0 / max(-mv.z, 1.0));
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: G + /* glsl */`
+        varying float vLife; varying vec3 vQ;
+        void main(){
+          float a = smoothstep(0.5, 0.06, length(gl_PointCoord - 0.5));
+          a *= uSteamI * 0.21 * smoothstep(0.0, 0.10, vLife) * (1.0 - smoothstep(0.40, 0.95, vLife)) * exp(-max(vQ.y, 0.0) / 17.0);
+          vec3 lit = uVaultC * uVaultI * 1.1 + uPaleC * uPaleI * 0.35
+                   + fireLight(vQ, vec3(0.0, -1.0, 0.0)) * 0.42 * exp(-max(vQ.y, 0.0) / 9.0);
+          vec3 col = mix(vec3(1.0, 0.96, 0.92), vec3(0.74, 0.74, 0.78), smoothstep(0.05, 0.6, vLife)) * lit;
+          gl_FragColor = vec4(col, a * ashAtt(vQ));
+        ` + TAIL,
+    });
+    return addPoints(ctx, g, mat);
+  }
+
+  buildAsh(ctx) {
+    const { rr } = ctx, N = 3000;
+    const p = new Float32Array(N * 3), seed = new Float32Array(N), size = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      p[i * 3] = rr(-110, 110); p[i * 3 + 1] = rr(0, 62); p[i * 3 + 2] = rr(-110, 110);
+      seed[i] = rr(0, 100); size[i] = rr(0.5, 2.0);
+    }
+    const g = pointGeo(p, seed, size);
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.NormalBlending,
+      uniforms: uniformsFor(ctx.U, {}),
+      vertexShader: G + /* glsl */`
+        attribute float aSeed, aSize; varying vec3 vQ; varying float vSz;
+        void main(){
+          vec3 q = position;
+          vec2 w = gustAt(q);
+          q.y -= mod(uTime * (1.2 + 1.8 * aSize) + aSeed * 13.0, 64.0);
+          q.x += w.x * uTime * 2.2 + 1.4 * sin(uTime * 0.6 + aSeed);
+          q.z += w.y * uTime * 2.2 + 1.4 * cos(uTime * 0.5 + aSeed * 1.7);
+          q.x = mod(q.x + 110.0, 220.0) - 110.0;
+          q.z = mod(q.z + 110.0, 220.0) - 110.0;
+          q.y = mod(q.y + 2.0, 64.0) - 2.0;
+          vQ = q; vSz = aSize;
+          vec4 mv = viewMatrix * vec4(q, 1.0);
+          gl_PointSize = aSize * (48.0 / max(-mv.z, 1.0));
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: G + /* glsl */`
+        varying vec3 vQ; varying float vSz;
+        void main(){
+          float a = smoothstep(0.5, 0.12, length(gl_PointCoord - 0.5)) * uAshFall * 0.60;
+          vec3 col = uAshC * (0.7 + 0.5 * vSz) * 0.9 + fireLight(vQ, vec3(0.0, -1.0, 0.0)) * 0.10;
+          gl_FragColor = vec4(col, a * ashAtt(vQ));
+        ` + TAIL,
+    });
+    return addPoints(ctx, g, mat);
+  }
+
+  buildEmbers(ctx) {
+    const { rr } = ctx, N = 1500;
+    const src = this.seamPoints(ctx, 220, 0.20);
+    const p = new Float32Array(N * 3), seed = new Float32Array(N), size = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const v = src[i % src.length];
+      p[i * 3] = v[0] + rr(-0.9, 0.9); p[i * 3 + 1] = v[1]; p[i * 3 + 2] = v[2] + rr(-0.9, 0.9);
+      seed[i] = rr(0, 1); size[i] = rr(0.6, 1.6);
+    }
+    const g = pointGeo(p, seed, size);
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      uniforms: uniformsFor(ctx.U, {}),
+      vertexShader: G + /* glsl */`
+        attribute float aSeed, aSize; varying float vLife, vHeat; varying vec3 vQ;
+        void main(){
+          float sp = 0.22 + 0.30 * fract(aSeed * 13.7);
+          float life = fract(uTime * sp + aSeed * 9.0);
+          vec3 q = position;
+          q.y += life * (7.0 + 16.0 * aSize);
+          q.x += 2.4 * life * sin(uTime * 1.3 + aSeed * 31.0) + gustAt(q).x * life * 5.0;
+          q.z += 2.4 * life * cos(uTime * 1.1 + aSeed * 17.0) + gustAt(q).y * life * 5.0;
+          vLife = life; vQ = q; vHeat = emberAt(vec3(position.x, q.y, position.z));
+          vec4 mv = viewMatrix * vec4(q, 1.0);
+          gl_PointSize = (1.4 + 2.2 * aSize) * (1.0 - 0.5 * life) * (70.0 / max(-mv.z, 1.0));
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: G + /* glsl */`
+        varying float vLife, vHeat; varying vec3 vQ;
+        void main(){
+          float a = smoothstep(0.5, 0.0, length(gl_PointCoord - 0.5));
+          float flick = 0.55 + 0.45 * sin(uTime * 19.0 + vQ.x * 3.1 + vQ.z * 2.7);
+          float f = a * vHeat * flick * (1.0 - smoothstep(0.35, 1.0, vLife));
+          vec3 col = mix(vec3(1.0, 0.86, 0.55), uLavaC * 0.7, smoothstep(0.0, 0.8, vLife));
+          gl_FragColor = vec4(col * f * 1.4, f * ashAtt(vQ));
+        ` + TAIL,
+    });
+    return addPoints(ctx, g, mat);
+  }
+
+  update() { /* every population is uTime/uGust driven in its vertex shader */ }
+}
+
+function pointGeo(p, seed, size) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(p, 3));
+  g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+  g.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  return g;
+}
+
+function addPoints(ctx, g, mat) {
+  const pts = new THREE.Points(g, mat);
+  pts.frustumCulled = false;
+  ctx.scene.add(pts);
+  return pts;
+}
+
+// ---- camera.js ----
+
+/* ═══ COMPONENT: Camera ═══
+   A slow traverse of the caldera floor, on a drifting arc so the seam network
+   passes under and across the view instead of running away to a vanishing point.
+
+   The framing rule for this world is the opposite of the usual one. The bright
+   thing is DOWN, so the rig sits low — a little over three units over the crust —
+   and holds a shallow downward tilt: enough that the fissures fill the lower half
+   and light the frame, but not so much that the caldera wall and the ash vault
+   leave it. Lose the wall and the world has no scale; lose the floor and it has no
+   light. Every state is judged from a viewpoint that keeps both. */
+class CameraRig {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.look = new THREE.Vector3();
+  }
+  update(dt, t) {
+    const { camera } = this.ctx;
+    const a = t * 0.030;
+    const r = 40 + 13 * Math.sin(t * 0.019 + 1.1);
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const ground = crustH(x, z);
+    camera.position.set(x, ground + 6.2 + 0.20 * Math.sin(t * 1.15), z);
+
+    // aim ahead along the arc and a touch inboard, so the pan and the far wall
+    // both stay in shot; the shallow rise and fall re-weights floor against sky
+    const af = a + 0.60;
+    const rf = Math.min(BOWL - 8, r + 10 * Math.sin(t * 0.045));
+    const fx = Math.cos(af) * rf, fz = Math.sin(af) * rf;
+    this.look.set(fx, crustH(fx, fz) - 0.4 + 1.5 * Math.sin(t * 0.055), fz);
+    camera.lookAt(this.look);
+    // roll about the camera's OWN forward axis. Assigning camera.rotation.z after a
+    // lookAt is not the same thing: for these headings the Euler decomposition lands
+    // on the (x≈-π, z≈π) branch, and overwriting z alone rolls the rig 180° — the
+    // caldera renders upside down, floor on the ceiling, and still passes every gate.
+    camera.rotateZ(0.018 * Math.sin(t * 0.09));
+  }
+}
+
+// ---- postfx.js ----
+
+/* ═══ COMPONENT: PostFX ═══
+   Bloom + hand-written ACES pass (gamma + vignette); plain fallback if the
+   composer is unavailable. Contract boilerplate (SCENE_CONTRACT §11). */
+class PostFX {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { renderer, scene, camera } = ctx;
+    try {
+      this.composer = new EffectComposer(renderer); this.composer.addPass(new RenderPass(scene, camera));
+      this.bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.4, 0.45, 0.92); this.composer.addPass(this.bloom);
+      this.out = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uExposure: F(1) }, vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform sampler2D tDiffuse; uniform float uExposure; varying vec2 vUv;
+        vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+        void main(){ vec3 c = texture2D(tDiffuse, vUv).rgb * uExposure; c = aces(c); float v = 1.0 - 0.28 * pow(length(vUv - 0.5) * 1.35, 2.5);
+          gl_FragColor = vec4(pow(c * v, vec3(1.0 / 2.2)), 1.0); }` });
+      this.composer.addPass(this.out); renderer.toneMapping = THREE.NoToneMapping;
+    } catch (e) { console.warn('post-processing unavailable, plain render', e); this.composer = null; }
+  }
+  resize(w, h) { if (this.composer) { this.composer.setSize(w, h); this.bloom.setSize(w, h); } }
+  render() {
+    const { renderer, scene, camera, cur } = this.ctx;
+    if (this.composer) { this.bloom.strength = cur.bloom; this.out.uniforms.uExposure.value = cur.exposure; this.composer.render(); }
+    else { renderer.toneMappingExposure = cur.exposure; renderer.render(scene, camera); }
+  }
+}
+
+// ---- scene.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE: Caldera — an active volcanic caldera, ash and steam.
+
+   The light comes from the GROUND. Glowing fissures in the crust are the only
+   real source in the world; the sky is a lid of ash and the darkest thing in
+   frame. So faces point DOWN toward the light, the caldera's shadow is cast
+   upward onto its own wall, and every layer shades against fireLight() rather
+   than against a sun.
+
+   Enumerated manifest: four named states, each of which moves the LIGHTING MODEL
+   and not merely the palette — how much the fissures are emitting, how far up
+   their light reaches (uGlowH), how much of the medium scatters it back, and how
+   much (if any) daylight the ash pall is letting through from above.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const STATES = {
+  'dawn-ash': {
+    caption: 'Grey morning leaks through the pall — the most light this sky will ever have, and still less than the ground is giving back.',
+    ashC: [0.105, 0.088, 0.082], ashD: 0.0030, ashFall: 0.22,
+    vaultC: [0.062, 0.064, 0.080], vaultI: 0.62,
+    paleC: [0.56, 0.58, 0.66], paleI: 0.20, paleEl: 0.35, paleAz: 2.30,
+    lavaC: [1.00, 0.42, 0.13], crackI: 0.95, crackW: 0.135, fireI: 2.1, glowH: 17,
+    crustC: [1.00, 0.95, 0.92], sulphC: [0.66, 0.58, 0.20],
+    warp: 0.50, steamI: 1.00, sparkI: 0.70, scorch: 0.50, starI: 0.0,
+    gustX: 0.10, gustZ: 0.05, birdRate: 0.9, bloom: 0.40, exposure: 1.00 },
+  'fissure-open': {
+    caption: 'A seam rips open across the pan. Everything in the caldera is suddenly lit from underneath, and the sky goes to nothing by comparison.',
+    ashC: [0.135, 0.075, 0.050], ashD: 0.0034, ashFall: 0.30,
+    vaultC: [0.038, 0.038, 0.048], vaultI: 0.34,
+    paleC: [0.50, 0.44, 0.40], paleI: 0.05, paleEl: 0.55, paleAz: 2.30,
+    lavaC: [1.00, 0.48, 0.16], crackI: 1.90, crackW: 0.195, fireI: 4.4, glowH: 30,
+    crustC: [1.00, 0.92, 0.88], sulphC: [0.70, 0.60, 0.22],
+    warp: 1.40, steamI: 1.45, sparkI: 2.00, scorch: 0.72, starI: 0.0,
+    gustX: 0.22, gustZ: 0.10, birdRate: 1.5, bloom: 0.52, exposure: 0.93 },
+  'ashfall': {
+    caption: 'Ash comes down heavy enough to bury the seams. The glow no longer reaches anything — it just sits in the air, a few metres deep.',
+    ashC: [0.078, 0.068, 0.062], ashD: 0.0105, ashFall: 1.00,
+    vaultC: [0.050, 0.047, 0.046], vaultI: 0.34,
+    paleC: [0.48, 0.42, 0.38], paleI: 0.05, paleEl: 0.80, paleAz: 2.30,
+    lavaC: [1.00, 0.36, 0.11], crackI: 0.68, crackW: 0.115, fireI: 1.8, glowH: 12,
+    crustC: [0.84, 0.81, 0.79], sulphC: [0.58, 0.54, 0.26],
+    warp: 0.35, steamI: 0.60, sparkI: 0.25, scorch: 0.95, starI: 0.0,
+    gustX: 0.75, gustZ: 0.35, birdRate: 0.4, bloom: 0.26, exposure: 1.08 },
+  'night-glow': {
+    caption: 'No daylight at all. The floor is the only lamp left, the crust reads as the negative of its own cracks, and a few stars survive the zenith.',
+    ashC: [0.048, 0.036, 0.034], ashD: 0.0036, ashFall: 0.12,
+    vaultC: [0.022, 0.026, 0.044], vaultI: 0.55,
+    paleC: [0.30, 0.36, 0.55], paleI: 0.015, paleEl: 1.10, paleAz: 2.30,
+    lavaC: [1.00, 0.31, 0.08], crackI: 1.15, crackW: 0.300, fireI: 2.7, glowH: 24,
+    crustC: [1.00, 0.94, 0.90], sulphC: [0.60, 0.53, 0.22],
+    warp: 0.80, steamI: 1.10, sparkI: 1.40, scorch: 0.60, starI: 1.0,
+    gustX: 0.08, gustZ: 0.04, birdRate: 0.6, bloom: 0.62, exposure: 1.05 },
+};
+const ORDER = Object.keys(STATES);
+const isColor = (k) => Array.isArray(STATES[ORDER[0]][k]);
+
+const sceneDef = {
+  meta: { fov: 62, near: 0.1, far: 1600, pixelRatio: 1.5, rate: 1.1, seed: 11, toneMapping: 'ACESFilmicToneMapping' },
+
+  buildUniforms() {
+    return {
+      uTime: F(0),
+      uAshC: C3(), uAshD: F(0.006), uAshFall: F(0.3),
+      uVaultC: C3(), uVaultI: F(0.5),
+      uPaleDir: V3(0, -1, 0), uPaleC: C3(), uPaleI: F(0.2),
+      uLavaC: C3(), uCrustC: C3(), uSulphC: C3(),
+      uCrackI: F(1), uCrackW: F(0.16), uFireI: F(5), uGlowH: F(20), uWarp: F(0.6),
+      uSteamI: F(1), uSparkI: F(1), uScorch: F(0.6), uStarI: F(0),
+      uBowlR: F(BOWL), uRimY: F(RIM),
+      uGust: { value: new THREE.Vector2(0.12, 0.05) },
+    };
+  },
+
+  initialState() { const h = location.hash.slice(1); return STATES[h] ? h : ORDER[0]; },
+
+  resolveState(name) {
+    const s = STATES[STATES[name] ? name : ORDER[0]];
+    const t = {};
+    for (const k in s) { if (k === 'caption') continue; t[k] = isColor(k) ? new THREE.Color(...s[k]) : s[k]; }
+    return t;
+  },
+
+  applyToUniforms(cur, ctx) {
+    const U = ctx.U;
+    U.uAshC.value.copy(cur.ashC); U.uAshD.value = cur.ashD; U.uAshFall.value = cur.ashFall;
+    U.uVaultC.value.copy(cur.vaultC); U.uVaultI.value = cur.vaultI;
+    U.uPaleC.value.copy(cur.paleC); U.uPaleI.value = cur.paleI;
+    U.uLavaC.value.copy(cur.lavaC); U.uCrustC.value.copy(cur.crustC); U.uSulphC.value.copy(cur.sulphC);
+    U.uCrackI.value = cur.crackI; U.uCrackW.value = cur.crackW;
+    U.uFireI.value = cur.fireI; U.uGlowH.value = cur.glowH; U.uWarp.value = cur.warp;
+    U.uSteamI.value = cur.steamI; U.uSparkI.value = cur.sparkI;
+    U.uScorch.value = cur.scorch; U.uStarI.value = cur.starI;
+    U.uGust.value.set(cur.gustX, cur.gustZ);
+    // the weak overhead term. There is no sun here: this is diffuse daylight or
+    // starlight arriving through ash, and it never outweighs what fireLight() adds.
+    const ce = Math.cos(cur.paleEl);
+    U.uPaleDir.value.set(-ce * Math.sin(cur.paleAz), -Math.sin(cur.paleEl), -ce * Math.cos(cur.paleAz)).normalize();
+  },
+
+  setup(ctx) { ctx.scene.background = ctx.U.uAshC.value; },
+
+  layers: [Crust, Vault, Scorch, Skein, Plumes],
+  camera: CameraRig,
+  postfx: PostFX,
+
+  onHashChange(sm) { const name = STATES[location.hash.slice(1)] ? location.hash.slice(1) : ORDER[0]; sm.setState(name); showState(name); },
+
+  setupUI(ctx, sm) {
+    captionEl = document.getElementById('caption'); nav = document.getElementById('nav');
+    ORDER.forEach((n) => { const b = document.createElement('button'); b.textContent = n; b.dataset.state = n; b.addEventListener('click', () => { location.hash = n; }); nav.appendChild(b); });
+    showState(sceneDef.initialState(), true);
+  },
+};
+
+// ---- caption + nav (module-scoped, wired in setupUI) ----
+let captionEl, nav;
+function showState(name, instant = false) {
+  nav.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.state === name));
+  captionEl.classList.add('fade');
+  setTimeout(() => { captionEl.textContent = STATES[name].caption; captionEl.classList.remove('fade'); }, instant ? 0 : 500);
+}
+
+boot(document.getElementById('scene'), sceneDef);
+
+</script>
+</body>
+</html>

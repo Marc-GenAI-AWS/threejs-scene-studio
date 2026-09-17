@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Specialist models — Three.js worlds written by small fine-tuned models</title>
+<style>
+  :root{ --bg:#0d1117; --panel:#161d26; --hair:#26323f; --ink:#e8eef4; --dim:#93a6b8; --ok:#4bd08a; --accent:#c8a2ff; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg); color:var(--ink); font-family:"Inter","Segoe UI",system-ui,sans-serif; line-height:1.6;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1040px; margin:0 auto; padding:0 24px}
+  header{padding:72px 0 40px}
+  h1{font-size:40px; font-weight:680; letter-spacing:-.2px}
+  h1 .sub{display:block; font-size:17px; font-weight:400; color:var(--dim); margin-top:14px; max-width:74ch}
+  h2{font-size:22px; font-weight:640; margin:0 0 6px}
+  section{padding:40px 0; border-top:1px solid var(--hair)}
+  .lede{color:var(--dim); max-width:74ch; margin-bottom:26px}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:20px}
+  .card{background:var(--panel); border:1px solid var(--hair); border-radius:14px; overflow:hidden;
+        display:flex; flex-direction:column}
+  .card img{width:100%; aspect-ratio:8/5; object-fit:cover; display:block; background:#0b0f14}
+  .card .body{padding:16px 18px 18px; display:flex; flex-direction:column; flex:1}
+  .card .theme{font-size:15px; color:var(--ink); margin-bottom:8px}
+  .card .meta{font-size:12.5px; color:var(--dim); font-family:ui-monospace,Menlo,monospace}
+  .card .why{font-size:13.5px; color:var(--dim); margin-top:8px; flex:1}
+  .card a.play{display:inline-block; margin-top:12px; font-size:14px; color:var(--accent); text-decoration:none;
+               border:1px solid #3d2f56; padding:6px 13px; border-radius:8px; align-self:flex-start}
+  .card a.play:hover{background:#221a33}
+  .steps{display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:16px; margin-top:8px}
+  .step{background:var(--panel); border:1px solid var(--hair); border-left:3px solid var(--accent);
+        border-radius:11px; padding:14px 16px}
+  .step h3{font-size:14.5px; font-weight:640; margin-bottom:5px}
+  .step p{font-size:13.5px; color:var(--dim)}
+  table{border-collapse:collapse; width:100%; margin-top:10px; font-size:14px}
+  .scroll{overflow-x:auto}
+  .scroll table{min-width:660px}
+  td.model{font-family:ui-monospace,Menlo,monospace; font-size:12.5px; color:var(--dim); white-space:nowrap}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--hair); vertical-align:top}
+  th{color:var(--dim); font-weight:600; font-size:12.5px; text-transform:uppercase; letter-spacing:.06em}
+  td.num{font-family:ui-monospace,Menlo,monospace}
+  .win{color:var(--ok)}
+  .diagram{width:100%; border:1px solid var(--hair); border-radius:14px; margin-top:8px}
+  .note{font-size:13.5px; color:var(--dim); margin-top:18px; max-width:78ch}
+  code{font-family:ui-monospace,Menlo,monospace; font-size:12.5px; background:#111823; border:1px solid var(--hair);
+       border-radius:5px; padding:1px 5px}
+  footer{padding:40px 0 72px; color:var(--dim); font-size:13px; border-top:1px solid var(--hair)}
+  footer a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Specialist models
+    <span class="sub">Playable Three.js worlds where every layer — sky, ground, camera, vegetation, fauna, effects —
+    is written by a small model fine-tuned on that one layer, and nothing is accepted until it renders.</span>
+  </h1>
+</header>
+
+<section>
+  <h2>How they were made</h2>
+  <p class="lede">A theme goes in; six briefs come out; six specialists write six layers; a render harness accepts or
+  rejects each one; the survivors are assembled into a single self-contained HTML file.</p>
+  <div class="steps">
+    <div class="step"><h3>1 · Plan</h3><p>A planner turns "a storm breaking over the high prairie" into one brief per
+      layer, chosen so the six agree with each other.</p></div>
+    <div class="step"><h3>2 · Write</h3><p>Each specialist writes only its own layer against a frozen contract — an 8B
+      LoRA per segment, and a 27B for the herd.</p></div>
+    <div class="step"><h3>3 · Verify</h3><p>Every layer is swapped into the frozen host and rendered headless. It must
+      parse, run, render, animate, hold up across the lighting states, and pass its own checks.</p></div>
+    <div class="step"><h3>4 · Compose</h3><p>Accepted layers are assembled and the finished scene is rendered again —
+      a layer that passes alone can still wash out in company.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>Seven worlds, one contract</h2>
+  <p class="lede">These are the reference worlds. Each is hand-built and hosts the layers the models write, so they are
+  also the yardstick every check is calibrated against. They deliberately disagree with each other about where light
+  comes from and what the medium is — a specialist trained on one world learns that world, and the goal is that it
+  learns the <em>contract</em> instead. Each is one self-contained file; click the state buttons to change the light.</p>
+  <div class="grid">
+
+    <div class="card">
+      <img src="shots/highpark.png" alt="A mountain-prairie basin under peaks" />
+      <div class="body">
+        <div class="theme">High Park</div>
+        <div class="meta">4 states · 12 layers</div>
+        <p class="why">Open daylight landscape — one sun, wind over turf. The world all six specialists were trained on.</p>
+        <a class="play" href="worlds/highpark.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/cenote.png" alt="A shaft of light in a flooded sinkhole" />
+      <div class="body">
+        <div class="theme">Cenote</div>
+        <div class="meta">4 states · 8 layers</div>
+        <p class="why">Light enters as a single shaft through a hole in the roof; caustics on the floor, and a diver's
+        torch as a second, moving source.</p>
+        <a class="play" href="worlds/cenote.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/canyon.png" alt="A slot canyon under hard desert light" />
+      <div class="body">
+        <div class="theme">Canyon</div>
+        <div class="meta">4 states · 5 layers</div>
+        <p class="why">A slot canyon. Most of the light on a shaded wall arrives <em>bounced off the opposite sunlit
+        wall</em>, not from the sky — layers that ignore it read as flat cut-outs.</p>
+        <a class="play" href="worlds/canyon.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/glacier.png" alt="An alpine glacier basin at extreme brightness" />
+      <div class="body">
+        <div class="theme">Glacier</div>
+        <div class="meta">4 states · 5 layers</div>
+        <p class="why">Inverted exposure: very bright, low contrast, snow scattering light back up so shadows are blue
+        and filled, never black. The ice is translucent and glows from within.</p>
+        <a class="play" href="worlds/glacier.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/citynight.png" alt="A rain-wet city street lit by neon and street lamps" />
+      <div class="body">
+        <div class="theme">City night</div>
+        <div class="meta">4 states · 5 layers</div>
+        <p class="why">The sharpest departure: <strong>no sun direction at all</strong>. Lit by a per-frame array of
+        point emitters — lamps, signs, windows, headlights — off a wet, mirror-like road.</p>
+        <a class="play" href="worlds/citynight.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/caldera.png" alt="A volcanic caldera lit from the ground by glowing fissures" />
+      <div class="body">
+        <div class="theme">Caldera</div>
+        <div class="meta">4 states · 5 layers</div>
+        <p class="why">Light comes from the <em>ground</em> — glowing fissures in cooled basalt. Faces point down
+        toward the light, shadows fall upward, and the sky is the darkest thing in frame.</p>
+        <a class="play" href="worlds/caldera.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/seastate.png" alt="Open ocean from a ship's bow at dusk" />
+      <div class="body">
+        <div class="theme">Sea state</div>
+        <div class="meta">20 states · partial host</div>
+        <p class="why">Open ocean, twenty lighting states. A partial world — ocean, rain and sky only — kept because
+        the water-presence check is calibrated against it.</p>
+        <a class="play" href="worlds/seastate.cdn.html">Open world →</a>
+      </div>
+    </div>
+
+  </div>
+  <p class="note">Every world above passes the same five structural gates — parses, runs, renders, animates, holds up
+  across states — with no changes to the harness. That the gates transfer unchanged across worlds this different is the
+  main evidence that what is being verified is the contract, not the scenery.</p>
+</section>
+
+<section>
+  <h2>Four scenes, one valley</h2>
+  <p class="lede">Same frozen host, same six slots, written by the specialists rather than by hand. Only the written
+  layers differ. Each was built in about ten minutes and is a single file you can open.</p>
+  <div class="grid">
+
+    <div class="card">
+      <img src="shots/scene-000.png" alt="Storm over the prairie with a bison herd" />
+      <div class="body">
+        <div class="theme">“a storm breaking over the high prairie as a bison herd bunches and runs for shelter”</div>
+        <div class="meta">6/6 layers accepted · every layer first attempt · 626 s</div>
+        <a class="play" href="scenes/scene-000.html">Open scene →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/scene-001.png" alt="Misty dawn with elk in the hollows" />
+      <div class="body">
+        <div class="theme">“a hushed misty dawn with elk grazing quietly in the hollows”</div>
+        <div class="meta">6/6 layers accepted · camera took 2 attempts · 703 s</div>
+        <a class="play" href="scenes/scene-001.html">Open scene →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/scene-002.png" alt="Windy midsummer afternoon with wild horses" />
+      <div class="body">
+        <div class="theme">“a bright windy midsummer afternoon with wild horses crossing rippling grass”</div>
+        <div class="meta">6/6 layers accepted · sky took 2 attempts · 598 s</div>
+        <a class="play" href="scenes/scene-002.html">Open scene →</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <img src="shots/scene-003.png" alt="Cold grey overcast day with elk on grazed turf" />
+      <div class="body">
+        <div class="theme">“a cold grey overcast day with a few deer picking through sparse, grazed turf”</div>
+        <div class="meta">6/6 layers accepted · every layer first attempt · 603 s</div>
+        <a class="play" href="scenes/scene-003.html">Open scene →</a>
+      </div>
+    </div>
+
+  </div>
+  <p class="note">The planner chose elk for the last one — the brief sampler it draws from has no deer. Nothing here was
+  hand-edited; these are the files the loop produced.</p>
+</section>
+
+<section>
+  <h2>What the specialists score</h2>
+  <p class="lede">Every segment is measured on 24 held-out briefs it has never seen, against the frontier model that
+  taught it. A layer passes only if it renders and clears that segment's own checks.</p>
+  <div class="scroll">
+  <table>
+    <tr><th>Layer</th><th>Specialist model</th><th>Scores</th><th>Teacher model</th><th>Scores</th><th>How it got there</th></tr>
+    <tr><td>Mist</td><td class="model">Qwen3-8B LoRA</td><td class="num win">95.8%</td><td class="model">Claude Fable 5.1</td><td class="num">96%</td><td>trained, then one critique-and-revise round</td></tr>
+    <tr><td>Camera</td><td class="model">Qwen3-8B LoRA</td><td class="num win">92%</td><td class="model">Claude Fable 5.1</td><td class="num">75%</td><td>trained once — beats its teacher</td></tr>
+    <tr><td>Ground</td><td class="model">Qwen3-8B LoRA</td><td class="num win">87.5%</td><td class="model">Claude Fable 5.1</td><td class="num">79%</td><td>54% → 87.5% after critique-and-revise</td></tr>
+    <tr><td>Sky</td><td class="model">Qwen3-8B LoRA</td><td class="num win">87.5%</td><td class="model">Claude Fable 5.1</td><td class="num">92%</td><td>71% → 87.5% after critique-and-revise</td></tr>
+    <tr><td>Grass</td><td class="model">Qwen3-8B LoRA</td><td class="num">70.8%</td><td class="model">Claude Fable 5.1</td><td class="num">79%</td><td>8% → 54% → 70.8% over two rounds</td></tr>
+    <tr><td>Herd</td><td class="model">Qwen3.8-27B LoRA</td><td class="num">37.5%</td><td class="model">Claude Fable 5.1</td><td class="num">100%</td><td>the hard one — 8B stalled at 21%; a 27B doubled it</td></tr>
+  </table>
+  </div>
+  <p class="note">Every specialist is an 8-billion-parameter LoRA except the herd, which needed a 27B. The herd is the
+  honest failure here: more data and a second training round barely moved it, and the layers that fail mostly render a
+  herd too small for the verifier to see.</p>
+</section>
+
+<section>
+  <h2>The verifier is the specification</h2>
+  <p class="lede">The loop only works because acceptance is mechanical. That cuts both ways — every real mistake in this
+  project was a verifier that measured the wrong thing.</p>
+  <table>
+    <tr><th>What happened</th><th>What it taught</th></tr>
+    <tr><td>Sky domes that never wrote a pixel passed every gate</td><td>added a presence check against a
+      dome-less render; the earlier 92% was void</td></tr>
+    <tr><td>Herds counted as “invisible” while plainly visible on screen</td><td>the check counted changed screen
+      tiles, so a compact herd failed however clear it was</td></tr>
+    <tr><td>A contract example got copied verbatim into 47 layers</td><td>contracts are written as prose now, never as
+      sample code</td></tr>
+    <tr><td>A scene passed every layer check and rendered near-white</td><td>layers are verified alone; the composite
+      needed its own check</td></tr>
+    <tr><td>A whole world rendered upside down and still scored a perfect gate</td><td>structural gates prove code
+      runs, not that the result is right; a camera roll flipped the up vector and nothing caught it</td></tr>
+  </table>
+</section>
+
+<section>
+  <h2>Deriving the contract instead of writing it</h2>
+  <p class="lede">Every contract bug in this project was a hand-written description drifting from the code it described:
+  a required <code>#define</code> never mentioned, helpers documented as taking a <code>vec3</code> that take a
+  <code>vec2</code>, a varying the fragment shader had to re-declare. All were invisible to the models trained on that
+  world — they had learned the convention from data — and fatal to a fresh model reading the contract literally.</p>
+  <p class="lede">So the world half of the prompt is now <strong>extracted from source</strong>, not written. A generator
+  reads the host and emits the helper signatures, which shader strings are complete programs versus snippets, uniform
+  names with their GLSL types, which per-state values are scalars versus colours, and the world's scale in world units.
+  A new world costs an extraction plus a paragraph of intent, and the description cannot drift from the code because it
+  is generated from it.</p>
+  <p class="note">The six worlds beyond High Park were built to test exactly this: the same derived-contract format,
+  with no harness changes, across worlds that disagree about where light comes from.</p>
+</section>
+
+<section>
+  <h2>The pipeline</h2>
+  <img class="diagram" src="pipeline.png" alt="Diagram of the scene-specialist pipeline" />
+</section>
+
+<footer>
+  One verifier, three jobs: it filters the training data, scores the reward, and accepts the loop's output — so
+  “accepted” and “rewarded” mean the same thing.<br />
+  Code and full write-up:
+  <a href="https://github.com/Marc-GenAI-AWS/Recipes/tree/main/recipes/model-customization/procedural-scene-specialists">procedural-scene-specialists</a>
+  ·
+  <a href="https://marc-genai-aws.github.io/godot-game/specialist-scenes/">the same recipe in Godot</a>
+</footer>
+
+</div>
+</body>
+</html>

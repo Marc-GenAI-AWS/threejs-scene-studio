@@ -1,0 +1,1131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Glacier — a high alpine basin under extreme brightness</title>
+<meta name="states" content="blue-dawn,white-noon,whiteout,alpenglow" />
+<style>
+  :root { --ink: #e6f2f0; --ink-dim: rgba(230,242,240,.42); --ink-mid: rgba(230,242,240,.74); --hairline: rgba(230,242,240,.16); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #041418; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; color: var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #ui::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 220px; background: linear-gradient(transparent, rgba(2,10,14,.55)); z-index: -1; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 22px 28px; }
+  .mark { font-size: 12px; font-weight: 500; letter-spacing: .34em; text-shadow: 0 1px 8px rgba(0,0,0,.5); }
+  .mark small { letter-spacing: .2em; font-weight: 400; color: var(--ink-dim); margin-left: 1.2em; font-size: 10px; }
+  .hint { font-size: 10px; letter-spacing: .12em; color: var(--ink-dim); }
+  footer { padding: 0 28px 26px; max-width: 720px; }
+  #caption { font-family: Georgia, "Times New Roman", serif; font-style: italic; font-size: 18px; line-height: 1.45; color: var(--ink-mid);
+    text-shadow: 0 1px 10px rgba(0,0,0,.6); min-height: 2.9em; transition: opacity .6s; }
+  #caption.fade { opacity: 0; }
+  nav { display: flex; gap: 8px; margin-top: 16px; pointer-events: auto; flex-wrap: wrap; }
+  nav button { appearance: none; background: transparent; border: 1px solid var(--hairline); color: var(--ink-dim); font: inherit; font-size: 10px;
+    letter-spacing: .2em; text-transform: uppercase; padding: 8px 14px; border-radius: 16px; cursor: pointer; transition: all .4s; backdrop-filter: blur(6px); }
+  nav button:hover { color: var(--ink); border-color: rgba(230,242,240,.4); }
+  nav button.on { color: #061418; background: rgba(190, 232, 226, .9); border-color: transparent; }
+  @media (max-width: 560px) { #caption { font-size: 15px; } }
+</style>
+<script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="ui">
+  <header><div class="mark">GLACIER <small>ICEFIELD</small></div><div class="hint">#state in the URL selects a scene</div></header>
+  <footer><div id="caption"></div><nav id="nav"></nav></footer>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ---- ../contract/runtime.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE CONTRACT — shared runtime (v1)
+   The scene-agnostic engine every scene boots against. See SCENE_CONTRACT.md.
+   Provides: uniform helpers, a seeded RNG, a state machine (enumerated OR
+   factored manifest), and the assembler loop. A scene supplies a `sceneDef`
+   (uniforms, layer classes, camera, state resolver, per-frame apply) to boot().
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* uniform helpers — a ShaderMaterial's uniforms is uniformsFor({...locals}) */
+const F  = (v) => ({ value: v });
+const C3 = () => ({ value: new THREE.Color() });
+const V3 = (x = 0, y = 0, z = 0) => ({ value: new THREE.Vector3(x, y, z) });
+const uniformsFor = (U, extra = {}) => ({ ...U, ...extra });
+
+/* deterministic RNG (park–miller); no Math.random in scene code */
+function makeRNG(seed = 7) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  const rr = (a, b) => a + (b - a) * rnd();
+  return { rnd, rr };
+}
+
+/* cur → target exponential interpolation of every visual parameter.
+   `resolve(name)` returns a fresh target object (numbers, THREE.Color, THREE.Vector3).
+   Colors/Vectors lerp via .lerp; numbers lerp arithmetically. */
+class StateMachine {
+  constructor({ initial, resolve, rate = 1.2, onApply }) {
+    this.resolve = resolve; this.rate = rate; this.onApply = onApply;
+    this.cur = {}; this.target = {};
+    this.setState(initial, true);
+  }
+  setState(name, instant = false) {
+    const t = this.resolve(name);
+    for (const k in t) if (!(k in this.cur)) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+    this.target = t;
+    if (instant) for (const k in t) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+  }
+  tick(dt, t, ctx) {
+    const k = 1 - Math.exp(-dt * this.rate), cur = this.cur, tg = this.target;
+    for (const key in tg) {
+      const c = cur[key], target = tg[key];
+      if (typeof c === 'number') cur[key] = c + (target - c) * k;
+      else if (c && c.lerp) c.lerp(target, k);
+    }
+    if (this.onApply) this.onApply(cur, ctx, t);
+  }
+}
+
+/* boot the frozen skeleton: renderer, scene, camera, layers[], main loop.
+   sceneDef: { meta, buildUniforms(), resolveState(name), initialState(),
+               applyToUniforms(cur,ctx,t), layers:[Class], camera:Class,
+               postfx?:Class, setupUI?(ctx,sm), onHashChange?(sm) } */
+function boot(canvas, sceneDef) {
+  const meta = sceneDef.meta || {};
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, meta.pixelRatio ?? 2));
+  renderer.setSize(innerWidth, innerHeight);
+  if (meta.toneMapping && THREE[meta.toneMapping]) renderer.toneMapping = THREE[meta.toneMapping];
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(meta.fov ?? 55, innerWidth / innerHeight, meta.near ?? 0.5, meta.far ?? 10000);
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const { rnd, rr } = makeRNG(meta.seed ?? 7);
+  const U = sceneDef.buildUniforms();
+  const ctx = { THREE, renderer, scene, camera, U, rnd, rr, reducedMotion, cur: null };
+
+  const sm = new StateMachine({
+    initial: sceneDef.initialState(),
+    resolve: (name) => sceneDef.resolveState(name),
+    rate: meta.rate ?? 1.2,
+    onApply: (cur, c, t) => sceneDef.applyToUniforms(cur, c, t),
+  });
+  ctx.cur = sm.cur;
+
+  // scene-level setup (background, renderer tweaks) before layers are built
+  if (sceneDef.setup) sceneDef.setup(ctx);
+
+  const layers = (sceneDef.layers || []).map((L) => new L(ctx));
+  const rig = sceneDef.camera ? new sceneDef.camera(ctx) : null;
+  const post = sceneDef.postfx ? new sceneDef.postfx(ctx) : null;
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); if (post && post.resize) post.resize(innerWidth, innerHeight);
+  });
+  addEventListener('hashchange', () => sceneDef.onHashChange ? sceneDef.onHashChange(sm) : sm.setState(location.hash.slice(1)));
+  if (sceneDef.setupUI) sceneDef.setupUI(ctx, sm);
+
+  const clock = new THREE.Clock(); let t = 0;
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05); t += dt;
+    U.uTime.value = t;
+    sm.tick(dt, t, ctx);
+    if (rig) rig.update(dt, t, ctx);
+    for (const l of layers) if (l.update) l.update(dt, t);
+    if (post) post.render(); else renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+  return { ctx, sm, layers, rig, post };
+}
+
+// ---- field.js ----
+
+// Glacier geometry constants + the shared ice-surface height field. The CPU noise
+// mirrors the GLSL noise so the mesh, the lichen placement, the spindrift and the
+// camera all agree about where the ice is.
+//
+// The basin runs along z: -z is UP-glacier (the headwall), +z is down toward the
+// snout. Ice fills |x - flowline(z)| < EDGE; beyond that the lateral moraine climbs.
+
+const BASIN = 320;        // length of the basin along z
+const HALF = 112;         // plane half-width in x
+const EDGE = 44;          // half-width of the ice tongue
+const CREST = 58;         // lateral moraine / ridge height
+const HEADW = 74;         // headwall height at the back of the basin
+const MEDIAL = 15;        // x-offset of the medial moraine: rubble riding on the ice
+
+const hashA = (x, y, z) => { const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return s - Math.floor(s); };
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+function vnoiseA(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z); let xf = x - xi, yf = y - yi, zf = z - zi;
+  xf = xf * xf * (3 - 2 * xf); yf = yf * yf * (3 - 2 * yf); zf = zf * zf * (3 - 2 * zf);
+  const c = (dy, dz) => lerp(hashA(xi, yi + dy, zi + dz), hashA(xi + 1, yi + dy, zi + dz), xf);
+  return lerp(lerp(c(0, 0), c(1, 0), yf), lerp(c(0, 1), c(1, 1), yf), zf);
+}
+function fbmA(x, y, z, o = 4) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < o; i++) { s += a * vnoiseA(x, y, z); x = x * 2.03 + 1.3; y = y * 2.01 + 0.7; z = z * 1.97 + 2.1; a *= 0.5; }
+  return s;
+}
+
+// The ice stream wanders as it comes down the basin.
+const flowline = (z) => 6.0 * Math.sin(z * 0.012) + 2.5 * Math.sin(z * 0.031 + 1.1);
+
+// Crevasse field. Purely analytic (no noise) so the JS mesh and the GLSL
+// crevasseMask() agree to the pixel: transverse bands that curve down-glacier and
+// open hardest at the margins, where the ice drags against the rock.
+const crevasseT = (x, z) => {
+  const xc = x - flowline(z);
+  const ph = z * 0.26 + xc * 0.016 + 1.7 * Math.sin(xc * 0.035 + z * 0.011) + 0.9 * Math.sin(z * 0.05 - xc * 0.02);
+  const s = Math.sin(z * 0.021 + 1.0);
+  const zone = Math.min(1, 0.46 + 0.54 * s * s + 0.50 * sstep(24, 44, Math.abs(xc)));
+  // only the glacier cracks. Without this gate the transverse bands climb the
+  // headwall and the back of the basin turns into a wedding cake.
+  const ice = (1 - sstep(EDGE - 7, EDGE + 3, Math.abs(xc))) * sstep(-BASIN / 2 + 60, -BASIN / 2 + 108, z);
+  return (1 - sstep(0.0, 0.38, Math.abs(Math.sin(ph)))) * zone * ice;
+};
+
+// domain: |x| <= HALF, |z| <= BASIN/2; range: ~-16 at the snout up to CREST/HEADW.
+// Owned by Icefield; sampled by Lichen/Spindrift placement and the CameraRig.
+const iceH = (x, z) => {
+  const xc = x - flowline(z);
+  const fall = -z * 0.095;                                           // the whole surface tilts down-glacier
+  const crown = 3.4 * Math.exp(-(xc * xc) / 1800);                   // glaciers are convex in cross-section
+  const swell = 1.7 * fbmA(x * 0.02, 1, z * 0.02, 3)
+              + 0.75 * Math.sin(z * 0.085 + 2.0 * fbmA(x * 0.04, 2, z * 0.03, 2));  // ogives and wind swells
+  // sastrugi: the wind carves the surface at a few metres, and without it the near
+  // foreground is an unreadable white sheet — the one thing this world cannot afford
+  const sastrugi = 0.34 * Math.sin(x * 0.62 + 3.0 * fbmA(x * 0.05, 8, z * 0.05, 2))
+                 + 0.24 * Math.sin(z * 0.85 + x * 0.25 + 2.0 * fbmA(x * 0.09, 6, z * 0.09, 2))
+                 + 0.50 * (fbmA(x * 0.22, 3, z * 0.22, 3) - 0.5);
+  const medial = 0.95 * Math.exp(-((xc - MEDIAL) ** 2) / 11) * sstep(-46, 34, z);   // debris stripe on the ice
+  // the crevasse profile is raised to a power before it is cut: a crevasse is a
+  // narrow slot with near-vertical walls, and a soft wide dip of the same depth
+  // reads as a snow dune instead
+  let h = fall + crown + swell + sastrugi + medial - 9.0 * crevasseT(x, z) ** 1.9;
+  const ht = Math.pow(sstep(-BASIN / 2 + 88, -BASIN / 2 + 4, z), 1.35);            // headwall at the back
+  h += HEADW * ht + (17.0 * (fbmA(x * 0.022, 11, z * 0.022, 4) - 0.45)
+                   + 6.5 * (fbmA(x * 0.07, 13, z * 0.07, 3) - 0.5)) * ht;
+  const d = Math.abs(xc) - EDGE;
+  if (d > 0) {
+    const climb = Math.min(1, d / 54) ** 0.78;
+    // broken rock, not a smooth cone: two octaves of relief carve the skyline
+    const rough = 12.0 * (fbmA(x * 0.035, 7, z * 0.035, 4) - 0.45)
+                + 7.0 * (fbmA(x * 0.13, 9, z * 0.13, 3) - 0.5);
+    const benches = 2.0 * Math.sin(d * 0.34 + 3.0 * fbmA(x * 0.03, 5, z * 0.03, 2));
+    h += CREST * climb + (benches + rough) * Math.min(1, d / 9);
+  }
+  return h;
+};
+
+// "is this point out on the open ice" / "is it up on the rock" — for placement code.
+const onIce = (x, z) => Math.abs(x - flowline(z)) < EDGE - 3;
+const onRock = (x, z) => { const d = Math.abs(x - flowline(z)) - EDGE; return d > 1.5 && d < 30; };
+
+const UP = new THREE.Vector3(0, 1, 0);
+
+// ---- prelude.glsl.js ----
+
+// Glacier GLSL prelude. G = core noise + this world's fields (crevasses, subsurface
+// ice glow, snow glint, upwash). VERT_WORLD / FRAG_ICE are the bases every surface
+// material derives from by string-surgery. TAIL is the tonemap/colorspace close.
+//
+// The distinctive field here is upwash(): on a snowfield most of the light on a
+// shaded or downward-facing surface arrives from BELOW, reflected off the snow.
+// Nothing here is allowed to go black — shadows are blue and filled. A layer that
+// shades with a plain lambert term reads as a cut-out pasted onto the glacier.
+//
+// The second signature is subsurface(): sun enters the ice, scatters, and leaves
+// again some metres away, so ice glows cyan from inside rather than reflecting.
+
+const G = /* glsl */`
+uniform float uTime; uniform vec3 uAirC; uniform float uAirD;
+uniform vec3 uSolarV, uSolarC; uniform float uSolarI;
+uniform vec3 uZenithC, uDomeC; uniform float uDomeI;
+uniform vec3 uUpwashC; uniform float uUpwashI;
+uniform vec3 uSnowC, uIceC, uMoraineC;
+uniform float uIceDepth, uGlareI, uWhiteout, uGlintI, uCrevasse, uDrift, uHaloI, uAlpenI, uLichenD;
+uniform float uEdgeX, uCrestY;
+uniform vec2 uGustV;
+float hsh1(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+vec2 hsh2(vec2 p){ return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
+float vnz3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hsh1(i), hsh1(i+vec3(1,0,0)), f.x), mix(hsh1(i+vec3(0,1,0)), hsh1(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(hsh1(i+vec3(0,0,1)), hsh1(i+vec3(1,0,1)), f.x), mix(hsh1(i+vec3(0,1,1)), hsh1(i+vec3(1,1,1)), f.x), f.y), f.z); }
+const mat3 SPIN = mat3(0.58, 0.44, -0.69, -0.69, 0.66, -0.16, 0.44, 0.61, 0.66);
+float turb3(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * vnz3(p); p = SPIN * p * 2.07 + 1.3; a *= 0.5; } return s; }
+float turb2(vec2 p){ return turb3(vec3(p, 0.61)); }
+
+/* where the ice is torn open. Mirrors crevasseT() in field.js exactly (analytic, no
+   noise) so the shading sits in the slot the mesh actually dips into. 1 = slot floor. */
+float crevasseMask(vec3 p){
+  float xc = p.x - (6.0 * sin(p.z * 0.012) + 2.5 * sin(p.z * 0.031 + 1.1));
+  float ph = p.z * 0.26 + xc * 0.016 + 1.7 * sin(xc * 0.035 + p.z * 0.011) + 0.9 * sin(p.z * 0.05 - xc * 0.02);
+  float s = sin(p.z * 0.021 + 1.0);
+  float zone = min(1.0, 0.46 + 0.54 * s * s + 0.50 * smoothstep(24.0, 44.0, abs(xc)));
+  /* only the glacier cracks — the rock margins and the headwall do not */
+  float ice = (1.0 - smoothstep(uEdgeX - 7.0, uEdgeX + 3.0, abs(xc))) * smoothstep(-100.0, -52.0, p.z);
+  return (1.0 - smoothstep(0.0, 0.38, abs(sin(ph)))) * zone * ice * uCrevasse;
+}
+
+/* how much bare rock the surface shows: the lateral moraine, and anything too steep
+   to hold snow on the headwall. */
+float moraineF(vec3 p, vec3 n){
+  float xc = p.x - (6.0 * sin(p.z * 0.012) + 2.5 * sin(p.z * 0.031 + 1.1));
+  float lat = smoothstep(uEdgeX - 4.0, uEdgeX + 8.0, abs(xc));
+  /* steep ground is bare rock ONLY up on the headwall. Ungated, this test also
+     catches every crevasse wall and every serac flank and paints the ice grey —
+     which quietly destroys the one thing this world is for. */
+  float steep = smoothstep(0.80, 0.40, n.y) * (1.0 - smoothstep(-100.0, -56.0, p.z));
+  /* the medial moraine: a stripe of rubble the ice carries down the middle */
+  float med = smoothstep(4.2, 1.4, abs(xc - 15.0)) * smoothstep(-46.0, -14.0, p.z);
+  return clamp(max(max(lat, steep), med) * (0.45 + 1.05 * turb2(p.xz * 0.055 + 4.0)), 0.0, 1.0);
+}
+
+/* THE signature: light that went INTO the ice and came back out. Cyan, strongest
+   where the path is long (crevasse walls, serac flanks) and where the sun is behind
+   the surface rather than on it. */
+vec3 subsurface(vec3 p, vec3 n){
+  float cv = crevasseMask(p);
+  float path = uIceDepth * (0.30 + 1.8 * cv + 0.5 * turb3(p * 0.07 + 2.0));
+  float enter = 0.30 + 0.70 * max(dot(n, -uSolarV), 0.0);
+  float leave = 0.45 + 0.55 * max(dot(normalize(cameraPosition - p), n), 0.0);
+  return uIceC * path * enter * leave * (0.35 + 0.85 * uSolarI);
+}
+
+/* light bounced back UP off the snow. On a glacier this is the dominant fill: it
+   lands on every downward-facing surface and keeps shadows blue instead of black. */
+vec3 upwash(vec3 p, vec3 n){
+  float down = 0.5 - 0.5 * n.y;
+  float open = 1.0 - 0.55 * crevasseMask(p);
+  return uUpwashC * uUpwashI * (0.30 + 1.05 * down) * open;
+}
+
+/* individual crystals catching the sun: a sparse quantised twinkle, not a specular
+   sheen. Held near the camera, where a real snowfield glitters. */
+float snowGlint(vec3 p, vec3 n){
+  vec3 v = normalize(cameraPosition - p);
+  vec3 hv = normalize(v - uSolarV);
+  float sp = pow(max(dot(n, hv), 0.0), 60.0);
+  float g = hsh1(floor(p * 22.0) + 0.5);
+  float tw = 0.5 + 0.5 * sin(uTime * 3.4 + g * 62.8);
+  float facet = smoothstep(0.972, 0.998, g * (0.55 + 0.45 * tw));
+  float near = smoothstep(110.0, 12.0, distance(p, cameraPosition));
+  return uGlintI * near * (sp * 0.45 + facet * 2.6 * pow(max(dot(n, hv), 0.0), 3.0));
+}
+
+/* thin, clean, high-altitude air: weak with distance but very bright, and it goes
+   opaque the moment cloud drops into the basin. */
+vec3 aerial(vec3 col, vec3 p){ float d = distance(p, cameraPosition);
+  float k = uAirD * (1.0 + 3.2 * uWhiteout);
+  return mix(col, uAirC, 1.0 - exp(-d * d * k * k)); }
+float aerialAtt(vec3 p){ float d = distance(p, cameraPosition);
+  float k = uAirD * (1.0 + 3.2 * uWhiteout); return exp(-d * d * k * k); }
+
+/* katabatic wind pouring off the ice, used by spindrift and the moss cushions. */
+vec2 gustAt(vec3 p){ return uGustV * (0.55 + 0.9 * turb2(p.xz * 0.03 + uTime * 0.09)); }
+`;
+
+const VERT_WORLD = /* glsl */`
+varying vec3 vP, vN; uniform float uFlex; uniform float uTime; uniform vec2 uGustV;
+void main(){
+  #ifdef USE_INSTANCING
+  mat4 m = modelMatrix * instanceMatrix;
+  #else
+  mat4 m = modelMatrix;
+  #endif
+  vec3 q = position;
+  if (uFlex > 0.0) { float s = clamp(q.y, 0.0, 1.0); s *= s;
+    q.xz += uFlex * s * (uGustV * 0.5 + vec2(sin(uTime * 2.3 + q.z * 3.0), cos(uTime * 1.9 + q.x * 3.0)) * 0.18); }
+  vec4 wp = m * vec4(q, 1.0);
+  vP = wp.xyz; vN = normalize(mat3(m) * normal); gl_Position = projectionMatrix * viewMatrix * wp; }`;
+
+const FRAG_ICE = G + /* glsl */`
+varying vec3 vP, vN; uniform float uGrit, uBare, uRocky;
+void main(){ vec3 p = vP;
+  /* near-field relief matters more here than anywhere: a snowfield with no grain in
+     the foreground is a sheet of white paper, and this world has nothing darker to
+     hide that behind */
+  float near = smoothstep(95.0, 6.0, distance(p, cameraPosition));
+  vec3 n = normalize(normalize(vN)
+    + 0.26 * vec3(vnz3(p * 0.55 + 1.0) - 0.5, vnz3(p * 0.55 + 2.0) - 0.5, vnz3(p * 0.55 + 3.0) - 0.5)
+    + 0.16 * vec3(vnz3(p * 2.4 + 1.0) - 0.5, vnz3(p * 2.4 + 2.0) - 0.5, vnz3(p * 2.4 + 3.0) - 0.5)
+    + near * 0.30 * vec3(vnz3(p * 4.6 + 1.0) - 0.5, vnz3(p * 4.6 + 5.0) - 0.5, vnz3(p * 4.6 + 9.0) - 0.5)
+    + near * 0.16 * vec3(vnz3(p * 15.0) - 0.5, vnz3(p * 15.0 + 4.0) - 0.5, vnz3(p * 15.0 + 8.0) - 0.5)
+    /* wind ripple: sastrugi lie in ranks across the basin, not at random */
+    + near * 0.22 * vec3(sin(p.x * 2.9 + 2.5 * turb2(p.xz * 0.35)), 0.0, sin(p.z * 2.1 + p.x * 0.7)));
+  float cv = crevasseMask(p);
+  float rockF = moraineF(p, n) * uRocky;
+  /* wind-scoured blue ice where the snow cover thins, and inside every crevasse */
+  float bare = clamp(uBare * (0.35 + 0.9 * turb3(p * 0.09 + 7.0)) + 0.85 * cv, 0.0, 1.0);
+  /* wind-combed streaks: stretched along x, the way sastrugi lie across the basin */
+  vec3 snow = uSnowC * (0.90 + 0.16 * turb3(p * 0.30))
+            * (1.0 - 0.13 * uGrit * turb3(vec3(p.x * 2.1, p.y * 0.7, p.z * 0.50)))
+            * (1.0 - 0.07 * uGrit * turb3(p * 6.5));
+  /* bare ice is layered: annual bands of bubbles and dust, near-horizontal, which is
+     what stops a serac reading as a sheet of coloured card */
+  vec3 blue = mix(uSnowC * 0.88, uIceC, 0.33)
+            * (0.74 + 0.52 * turb3(vec3(p.x * 0.75, p.y * 3.4, p.z * 0.75) + 5.0));
+  vec3 rock = uMoraineC * (0.55 + 0.85 * turb3(p * 0.40 + 3.0)) * (0.80 + 0.30 * turb3(p * 1.7));
+  vec3 base = mix(mix(snow, blue, bare), rock, rockF) * (1.0 - 0.42 * cv);
+  float lam = max(dot(n, -uSolarV), 0.0);
+  float shade = 1.0 - 0.90 * cv;                                       /* slots see almost no sun */
+  vec3 light = uSolarC * uSolarI * lam * shade * (1.0 - 0.72 * uWhiteout)
+             + uDomeC * uDomeI * (0.38 + 0.62 * max(n.y, 0.0)
+                 + 0.40 * max(dot(n, normalize(vec3(-uSolarV.x, 0.3, -uSolarV.z))), 0.0)) * (1.0 - 0.78 * cv)
+             + upwash(p, n);
+  /* a grazing view through the surface of clean ice goes bright at the edge */
+  float fres = pow(1.0 - clamp(dot(n, normalize(cameraPosition - p)), 0.0, 1.0), 3.0);
+  vec3 col = base * light
+           + mix(uSnowC, uIceC, 0.55) * fres * bare * (0.20 + 0.60 * uDomeI + 0.25 * uSolarI)
+           + subsurface(p, n) * (0.22 + 0.70 * bare + 1.0 * cv) * (1.0 - 0.85 * rockF)
+           + uSolarC * snowGlint(p, n) * (1.0 - rockF) * (1.0 - 0.7 * bare);
+  gl_FragColor = vec4(aerial(col, p), 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+const TAIL = /* glsl */`
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+// ---- materials.js ----
+
+// Material factories built by string-surgery on the shared bases. Reach for these
+// before writing a raw ShaderMaterial: they carry this world's crevasse shading,
+// subsurface glow, snow upwash and thin-air aerial perspective, so a mesh sits ON
+// the glacier rather than in front of a picture of one.
+
+const iceMat = (ctx, opts = {}) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, {
+    uGrit: F(opts.grit ?? 1),
+    uBare: F(opts.bare ?? 0.25),
+    uRocky: F(opts.rocky ?? 1),
+    uFlex: F(0),
+  }),
+  vertexShader: VERT_WORLD, fragmentShader: FRAG_ICE, side: opts.side ?? THREE.FrontSide,
+});
+
+// string surgery that fails loudly: a .replace() whose anchor has drifted out of the
+// prelude silently returns the original shader, and the layer then renders as the
+// thing it was derived from instead of the thing it was meant to be.
+const cut = (src, from, to) => { if (src.indexOf(from) < 0) throw new Error(`materials.js: anchor not found: ${from.slice(0, 48)}`); return src.split(from).join(to); };
+
+// Lichen and moss cushions: ice shading swapped for a crust palette, plus a carved
+// silhouette. A quad is a rectangle; a moss cushion clinging to a moraine block is
+// not — without the alpha discard the moraine grows rows of coloured postage stamps.
+const VERT_CRUST = cut(cut(VERT_WORLD,
+  'varying vec3 vP, vN;', 'varying vec3 vP, vN, vTint; varying vec2 vUv; attribute vec3 aTint;'),
+  'vP = wp.xyz;', 'vP = wp.xyz; vTint = aTint; vUv = uv;');
+
+const FRAG_CRUST = cut(cut(cut(FRAG_ICE,
+  'varying vec3 vP, vN; uniform float uGrit, uBare, uRocky;',
+  'varying vec3 vP, vN, vTint; varying vec2 vUv; uniform float uGrit, uBare, uRocky;'),
+  'void main(){ vec3 p = vP;', `void main(){ vec3 p = vP;
+  /* per-cushion offset so neighbouring instances are not the same silhouette */
+  vec2 co = floor(p.xz * 4.0);
+  float rad = abs(vUv.x - 0.5) * 2.0;
+  float y = clamp(vUv.y, 0.0, 1.0);
+  /* a squat dome broken into lobes, then eaten away at the edges */
+  float lobes = 0.72 + 0.34 * turb2(vec2(y * 4.0, 0.0) + co) + 0.16 * sin(y * 9.0 + turb2(co) * 6.28);
+  float prof = sqrt(max(1.0 - y * y * 0.94, 0.0)) * lobes;
+  float erode = 0.55 + 0.80 * turb2(vec2(vUv.x * 15.0, y * 19.0) + co * 2.7);
+  if (rad > prof * erode) discard;
+  if (turb2(vec2(vUv.x * 30.0, y * 26.0) + co * 6.1) < 0.33) discard;   /* open it into stems and grit */`),
+  'vec3 base = mix(mix(snow, blue, bare), rock, rockF) * (1.0 - 0.42 * cv);',
+  `vec3 base = mix(vTint, vec3(0.50, 0.47, 0.34), uLichenD * 0.55) * (0.70 + 0.55 * vnz3(p * 16.0));
+  rockF = 1.0; cv = 0.0;                                               /* crust is opaque: no ice glow */`);
+
+const crustMat = (ctx) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, { uGrit: F(0.4), uBare: F(0.0), uRocky: F(1), uFlex: F(0.35) }),
+  vertexShader: VERT_CRUST, fragmentShader: FRAG_CRUST, side: THREE.DoubleSide,
+});
+
+// ---- layers/icefield.js ----
+
+/* ═══ COMPONENT: Icefield (the ground) ═══
+   One mesh carrying the whole basin: the ice tongue, the crevasse field torn across
+   it, the lateral moraine and the headwall behind. Every vertex's y comes from
+   iceH(x, z) — the shared height field the lichen, the spindrift and the camera all
+   sample, so nothing floats or sinks.
+
+   This is the layer that carries the world's signature. Snow here is not white
+   paint: it is a translucent solid. FRAG_ICE puts subsurface() light back out of
+   the crevasse walls and upwash() back up into everything facing down, so the slots
+   read as cyan lamps sunk in the surface rather than as black cracks. */
+class Icefield {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const g = new THREE.PlaneGeometry(HALF * 2, BASIN, 224, 356);
+    g.rotateX(-Math.PI / 2);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) pos.setY(i, iceH(pos.getX(i), pos.getZ(i)));
+    pos.needsUpdate = true;
+    g.computeVertexNormals();
+
+    this.mesh = new THREE.Mesh(g, iceMat(ctx, { grit: 1.0, bare: 0.28 }));
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+
+    // Seracs: the ice tower blocks left standing between crevasses where the glacier
+    // breaks over a step. Bare blue ice, so they glow where the sun goes through them.
+    const { rr, rnd } = ctx;
+    const N = 110;
+    this.seracs = new THREE.InstancedMesh(serac(), iceMat(ctx, { grit: 0.35, bare: 0.92, rocky: 0.0 }), N);
+    this.seracs.frustumCulled = false;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+    const p = new THREE.Vector3(), s = new THREE.Vector3();
+    let n = 0, guard = 0;
+    while (n < N && guard++ < N * 60) {
+      const z = rr(-BASIN / 2 + 70, BASIN / 2 - 10);
+      const x = flowline(z) + rr(-EDGE + 2, EDGE - 2);
+      // a serac is the block left standing BETWEEN two crevasses, so place them on
+      // the lips rather than down in the slots
+      const c = crevasseT(x, z);
+      if (!onIce(x, z) || c < 0.16 || c > 0.52) continue;
+      if (Math.abs(x - flowline(z)) < 9) continue;      // keep the rig's corridor clear
+      // and it is a broken block, wider than it is tall as often as not, and it
+      // leans: uniform uprights read as a row of gravestones
+      const h = rr(1.3, 4.4), w = rr(1.2, 3.4) * (rnd() < 0.3 ? 1.6 : 1.0);
+      p.set(x, Math.max(iceH(x, z), iceH(x, z + 1.5), iceH(x, z - 1.5)) + h * 0.26, z);
+      e.set(rr(-0.42, 0.42), rr(0, Math.PI * 2), rr(-0.46, 0.46), 'YXZ');
+      q.setFromEuler(e);
+      s.set(w, h, w * rr(0.55, 1.2));
+      this.seracs.setMatrixAt(n, m.compose(p, q, s));
+      n++;
+    }
+    this.seracs.count = n;
+    this.seracs.instanceMatrix.needsUpdate = true;
+    ctx.scene.add(this.seracs);
+  }
+  update() { /* static geometry; all state response lives in the shared uniforms */ }
+}
+
+/* a leaning slab: a box tapered and sheared toward the top, built by hand so there
+   is no dependency on BufferGeometryUtils being in the assembled bundle. */
+function serac() {
+  const g = new THREE.BoxGeometry(1, 1, 1, 1, 2, 1);
+  g.translate(0, 0.5, 0);
+  const pos = g.attributes.position;
+  // jitter keyed to the CORNER, not the vertex index: a box duplicates its corners
+  // once per face, and moving those copies independently tears the block open
+  const j = (x, y, z, o) => { const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7 + o) * 43758.5453; return (s - Math.floor(s)) - 0.5; };
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i), k = 1 - 0.42 * y;
+    pos.setX(i, x * k + 0.22 * y * y + 0.22 * j(x, y, z, 1));
+    pos.setY(i, y + 0.15 * j(x, y, z, 37));
+    pos.setZ(i, z * (1 - 0.25 * y) + 0.20 * j(x, y, z, 71));
+  }
+  pos.needsUpdate = true;
+  g.computeVertexNormals();
+  return g;
+}
+
+// ---- layers/aether.js ----
+
+/* ═══ COMPONENT: Aether (the sky) ═══
+   Air at 3500 m is thin enough to be almost black overhead and blinding within ten
+   degrees of the sun. That gradient is the widest contrast in the scene and the
+   reason the snow reads as bright rather than merely pale — so the dome carries the
+   sun disc, its aureole, the 22° halo and the two sundogs that ice crystals in the
+   air throw either side of it. */
+class Aether {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const geo = new THREE.SphereGeometry(900, 48, 32);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, fog: false,
+      uniforms: uniformsFor(ctx.U, {}),
+      vertexShader: `varying vec3 vDir;
+        void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        vec3 s = -uSolarV;
+        float up = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+        /* deep at the zenith, bleached white at the horizon where the air piles up */
+        vec3 col = mix(uAirC, uZenithC, pow(clamp(d.y, 0.0, 1.0), 0.36)) * (0.85 + 0.35 * uDomeI);
+
+        float sd = clamp(dot(d, s), -1.0, 1.0);
+        float ang = acos(sd);
+        /* the sun: a small hard disc inside an enormous aureole. uGlareI is what
+           makes this world painful to look at rather than merely light. */
+        col += uSolarC * uSolarI * uGlareI *
+               (smoothstep(0.011, 0.004, ang) * 7.0 + pow(max(sd, 0.0), 260.0) * 2.2
+              + pow(max(sd, 0.0), 14.0) * 0.55 + pow(max(sd, 0.0), 3.0) * 0.14);
+
+        /* 22° halo and the two parhelia, thrown by plate crystals drifting in the air */
+        float halo = smoothstep(0.012, 0.0, abs(ang - 0.384)) * (1.0 + 0.6 * smoothstep(0.40, 0.384, ang));
+        col += mix(vec3(1.0, 0.92, 0.80), vec3(0.85, 0.95, 1.0), smoothstep(0.384, 0.40, ang)) * halo * uHaloI * 0.9;
+        vec3 sx = normalize(cross(vec3(0.0, 1.0, 0.0), s));
+        for (int k = 0; k < 2; k++) {
+          vec3 dogv = normalize(s + sx * (k == 0 ? 0.404 : -0.404));
+          float dg = max(dot(d, dogv), 0.0);
+          col += vec3(1.0, 0.90, 0.74) * uHaloI * pow(dg, 900.0) * 3.4;
+        }
+
+        /* alpenglow: the low sun reddens the band of air the peaks stand in */
+        col += vec3(1.0, 0.42, 0.34) * uAlpenI * pow(max(0.5 + 0.5 * sd, 0.0), 3.0)
+             * smoothstep(0.34, -0.02, d.y) * smoothstep(-0.16, 0.02, d.y);
+
+        /* cloud dropping into the basin: the dome loses its gradient entirely */
+        float cl = 0.45 + 0.55 * turb3(d * 6.0 + vec3(uTime * 0.02, 0.0, 0.0));
+        col = mix(col, uAirC * (0.92 + 0.30 * cl), uWhiteout * smoothstep(-0.25, 0.55, d.y) * 0.96);
+        col = mix(col, uAirC, pow(1.0 - up, 3.0) * 0.55 * (1.0 - uWhiteout));
+        gl_FragColor = vec4(col, 1.0);
+      ` + TAIL,
+    });
+    this.mesh = new THREE.Mesh(geo, mat);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+  }
+  update() { const { camera } = this.ctx; this.mesh.position.copy(camera.position); }
+}
+
+// ---- layers/lichen.js ----
+
+/* ═══ COMPONENT: Lichen (the vegetation) ═══
+   Almost nothing lives at this altitude, and the layer is sparse by design — there
+   is no turf to lay down. What there is grows on rock the ice has uncovered: map
+   lichen and rusty crustose scabs flat on the moraine blocks, and a few cushions of
+   hardy moss in the lee of the bigger stones, where meltwater runs and the katabatic
+   wind is broken.
+
+   Two populations from one crossed-quad geometry: crusts laid almost flat and wide,
+   cushions standing up. Both carve their silhouette with an alpha discard in
+   FRAG_CRUST — a quad is a rectangle, and a rectangle of green on grey rock reads
+   as a sticker, not a plant.
+
+   InstancedMesh, not InstancedBufferGeometry: only InstancedMesh makes three.js
+   define USE_INSTANCING, which VERT_WORLD needs to see instanceMatrix at all. */
+class Lichen {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+    const N = 620;
+
+    const geo = crossedQuads();
+    this.mesh = new THREE.InstancedMesh(geo, crustMat(ctx), N);
+    this.mesh.frustumCulled = false;
+
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+    const p = new THREE.Vector3(), s = new THREE.Vector3();
+    const tint = new Float32Array(N * 3);
+    let n = 0, guard = 0;
+    while (n < N && guard++ < N * 30) {
+      // two thirds on the medial moraine the camera walks beside, the rest out on
+      // the lateral moraine where the rock band is wide
+      let x, z;
+      if (rnd() < 0.72) {
+        z = rr(-38, BASIN / 2 - 8);
+        x = flowline(z) + MEDIAL + rr(-2.6, 2.6);
+      } else {
+        z = rr(-BASIN / 2 + 76, BASIN / 2 - 8);
+        x = flowline(z) + (rnd() < 0.5 ? -1 : 1) * (EDGE + rr(3.0, 16));
+        if (!onRock(x, z)) continue;
+        // only on ground flat enough to hold it — on the steep moraine faces a quad
+        // laid on the height field pokes out of the rock and reads as floating litter
+        if (Math.abs(iceH(x + 1.5, z) - iceH(x - 1.5, z)) > 2.4) continue;
+      }
+      const crust = rnd() < 0.68;
+      const h = crust ? rr(0.06, 0.14) : rr(0.22, 0.50);
+      p.set(x, iceH(x, z) - 0.04, z);
+      // crusts lie back against the stone they are eating; cushions stand upright
+      e.set(crust ? rr(1.05, 1.42) : rr(-0.12, 0.12), rr(0, Math.PI * 2), rr(-0.2, 0.2), 'YXZ');
+      q.setFromEuler(e);
+      const w = crust ? rr(0.55, 1.45) : rr(0.35, 0.65);
+      s.set(w, h * (crust ? 5.0 : 1.0), w);
+      this.mesh.setMatrixAt(n, m.compose(p, q, s));
+      const k = rr(0, 1);
+      if (crust) {                                  // map lichen: rust and pale sage,
+        if (rnd() < 0.5) {                          // never the sulphur yellow of a
+          tint[n * 3] = 0.30 + 0.20 * k;            // pot of paint
+          tint[n * 3 + 1] = 0.17 + 0.10 * k;
+          tint[n * 3 + 2] = 0.08 + 0.05 * k;
+        } else {
+          tint[n * 3] = 0.31 + 0.14 * k;
+          tint[n * 3 + 1] = 0.34 + 0.14 * k;
+          tint[n * 3 + 2] = 0.20 + 0.08 * k;
+        }
+      } else {                                      // moss cushion: dark olive
+        tint[n * 3] = 0.13 + 0.09 * k;
+        tint[n * 3 + 1] = 0.21 + 0.11 * k;
+        tint[n * 3 + 2] = 0.09 + 0.05 * k;
+      }
+      n++;
+    }
+    this.mesh.count = n;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    geo.setAttribute('aTint', new THREE.InstancedBufferAttribute(tint, 3));
+    ctx.scene.add(this.mesh);
+  }
+  update() { /* the cushions' flex is driven by uGustV/uTime inside VERT_CRUST */ }
+}
+
+/* two quads crossed at right angles, built explicitly so there is no dependency on
+   BufferGeometryUtils being present in the assembled bundle. */
+function crossedQuads() {
+  const g = new THREE.BufferGeometry();
+  const pos = [], nor = [], uv = [], idx = [];
+  const blades = [{ ax: 1, az: 0, nx: 0, nz: 1 }, { ax: 0, az: 1, nx: 1, nz: 0 }];
+  blades.forEach((b, k) => {
+    const o = k * 4;
+    pos.push(-0.5 * b.ax, 0, -0.5 * b.az, 0.5 * b.ax, 0, 0.5 * b.az,
+             0.5 * b.ax, 1, 0.5 * b.az, -0.5 * b.ax, 1, -0.5 * b.az);
+    for (let i = 0; i < 4; i++) nor.push(b.nx, 0.5, b.nz);
+    uv.push(0, 0, 1, 0, 1, 1, 0, 1);
+    idx.push(o, o + 1, o + 2, o, o + 2, o + 3);
+  });
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return g;
+}
+
+// ---- layers/ravens.js ----
+
+/* ═══ COMPONENT: Ravens (the fauna) ═══
+   Alpine choughs and ravens are the only large animals that work a glacier: they
+   ride the wind off the headwall, cut across the basin, and drop onto the medial
+   moraine to pick at whatever the ice gave up. Black on snow is the strongest
+   contrast in the frame, so they are what the eye finds first — they have to move
+   like birds or the whole scene goes to plastic.
+
+   Wings actually beat: aPh/aRate/aAmp per instance drive a flap in the vertex
+   shader that bends the wing along |x|, so a bird is never a rigid glyph. The
+   perched ones keep their wings folded and shuffle instead.
+
+   Scale matters — a raven is ~1.3 units across at the wing, seen from 15-60 units
+   away. Bigger and the basin stops reading as kilometres wide. */
+class Ravens {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+    const FLY = 11, PERCH = 5, N = FLY + PERCH;
+
+    this.birds = [];
+    for (let i = 0; i < FLY; i++) {
+      this.birds.push({
+        perched: false,
+        cx: rr(-24, 32), cz: rr(-40, 90),
+        r: rr(9, 30), y: rr(5, 22),
+        w: rr(0.09, 0.20) * (rnd() < 0.5 ? -1 : 1),
+        ph: rr(0, Math.PI * 2), span: rr(1.5, 2.2),
+      });
+    }
+    for (let i = 0; i < PERCH; i++) {
+      const z = rr(20, 84);
+      const x = flowline(z) + MEDIAL + rr(-2.2, 2.2);
+      this.birds.push({ perched: true, x, z, y: iceH(x, z) + 0.22, ph: rr(0, Math.PI * 2), span: rr(1.3, 1.7) });
+    }
+
+    const geo = ravenGeometry();
+    const ph = new Float32Array(N), rate = new Float32Array(N), amp = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      ph[i] = this.birds[i].ph;
+      rate[i] = this.birds[i].perched ? rr(0.4, 0.9) : rr(4.0, 6.2);
+      amp[i] = this.birds[i].perched ? 0.04 : rr(0.42, 0.72);
+    }
+    geo.setAttribute('aPh', new THREE.InstancedBufferAttribute(ph, 1));
+    geo.setAttribute('aRate', new THREE.InstancedBufferAttribute(rate, 1));
+    geo.setAttribute('aAmp', new THREE.InstancedBufferAttribute(amp, 1));
+
+    this.mesh = new THREE.InstancedMesh(geo, ravenMat(ctx), N);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+
+    this.m = new THREE.Matrix4(); this.q = new THREE.Quaternion();
+    this.p = new THREE.Vector3(); this.s = new THREE.Vector3(); this.e = new THREE.Euler();
+  }
+
+  update(dt, t) {
+    const { m, q, p, s, e } = this;
+    const sp = this.ctx.cur ? (this.ctx.cur.ravenSpeed ?? 1) : 1;
+    for (let i = 0; i < this.birds.length; i++) {
+      const b = this.birds[i];
+      if (b.perched) {
+        // a shuffle and a turn of the head: enough to read as alive, not as a prop
+        p.set(b.x + 0.16 * Math.sin(t * 0.6 * sp + b.ph), b.y + 0.05 * Math.abs(Math.sin(t * 1.4 * sp + b.ph)), b.z);
+        e.set(0, b.ph + 0.5 * Math.sin(t * 0.35 * sp + b.ph), 0, 'YXZ');
+      } else {
+        const a = b.ph + t * b.w * sp;
+        const x = b.cx + Math.cos(a) * b.r + 6.0 * Math.sin(t * 0.13 * sp + b.ph);
+        const z = b.cz + Math.sin(a) * b.r * 1.35;
+        const y = Math.max(b.y + 3.0 * Math.sin(t * 0.19 * sp + b.ph * 2.0), iceH(x, z) + 2.5);
+        p.set(x, y, z);
+        const heading = a + (b.w > 0 ? Math.PI / 2 : -Math.PI / 2);
+        e.set(0.10 * Math.sin(t * 0.5 + b.ph), heading, b.w > 0 ? -0.36 : 0.36, 'YXZ');
+      }
+      q.setFromEuler(e);
+      s.setScalar(b.span);
+      this.mesh.setMatrixAt(i, m.compose(p, q, s));
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+/* a raven in plan: blunt head, deep body, broad fingered wings and the wedge tail
+   that tells a raven from a crow. Flat, because a bird over snow is read from its
+   outline long before any of its shading. */
+function ravenGeometry() {
+  const g = new THREE.BufferGeometry();
+  const pos = [
+    0, 0, -0.46, 0, 0, 0.34,                      // 0 head   1 tail root
+    0, 0, 0.62, -0.13, 0, 0.56, 0.13, 0, 0.56,    // 2 tail tip  3,4 tail corners
+    -0.16, 0, -0.06, 0.16, 0, -0.06,              // 5,6 shoulders
+    -0.46, 0.03, 0.02, -0.50, 0.04, 0.20,         // 7,8 left wing leading/trailing
+    0.46, 0.03, 0.02, 0.50, 0.04, 0.20,           // 9,10 right
+  ];
+  const idx = [
+    0, 5, 1, 0, 1, 6,            // body
+    1, 3, 2, 1, 2, 4,            // wedge tail
+    5, 7, 8, 5, 8, 1,            // left wing
+    6, 1, 10, 6, 10, 9,          // right wing
+  ];
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+const ravenMat = (ctx) => new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: uniformsFor(ctx.U, { uFeatherC: F(new THREE.Color(0.045, 0.048, 0.062)) }),
+  vertexShader: /* glsl */`
+    varying vec3 vP, vN; uniform float uTime;
+    attribute float aPh; attribute float aRate; attribute float aAmp;
+    void main(){
+      #ifdef USE_INSTANCING
+      mat4 m = modelMatrix * instanceMatrix;
+      #else
+      mat4 m = modelMatrix;
+      #endif
+      vec3 q = position;
+      /* the beat: wings bend up and down along their length, and sweep back a
+         little at the top of the stroke */
+      float beat = sin(uTime * aRate + aPh);
+      float r = abs(q.x);
+      q.y += beat * aAmp * pow(r, 1.6) * 2.2;
+      q.z += (0.5 - 0.5 * beat) * aAmp * r * 0.35;
+      vec4 wp = m * vec4(q, 1.0);
+      vP = wp.xyz; vN = normalize(mat3(m) * normal);
+      gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: G + /* glsl */`
+    varying vec3 vP, vN; uniform vec3 uFeatherC;
+    void main(){
+      vec3 n = normalize(vN);
+      float lam = max(dot(n, -uSolarV), 0.0);
+      /* the glacier lights this bird from underneath: black feathers over snow pick
+         up a hard blue-white rim from upwash, which is what stops it reading as a
+         hole cut in the frame */
+      vec3 col = uFeatherC * (0.55 + 2.4 * uDomeI * 0.25 + 1.6 * lam * uSolarI)
+               + upwash(vP, n) * 0.85
+               + uDomeC * uDomeI * 0.12 * max(n.y, 0.0)
+               + uSolarC * uSolarI * pow(lam, 22.0) * 0.30;      /* gloss on the wing coverts */
+      gl_FragColor = vec4(aerial(col, vP), 1.0);
+    ` + TAIL,
+});
+
+// ---- layers/spindrift.js ----
+
+/* ═══ COMPONENT: Spindrift (the effects layer) ═══
+   Two things are always in the air here. Low down, spindrift: dry snow the katabatic
+   wind peels off the surface and runs downhill in sheets, so the ice appears to be
+   smoking. Higher up, diamond dust: ice crystals suspended in air too cold to hold
+   vapour, which do nothing at all until they turn edge-on to the sun and flare.
+
+   Additive points, so they brighten the air rather than occluding the ice — a
+   snowfield does not get darker when it is blowing, it gets more featureless. The
+   wrap box follows the camera, so density stays where it can be seen instead of
+   being spread thin over three hundred metres of basin. */
+const SPAN = 120;
+
+class Spindrift {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+    const N = 5200;
+    const pos = new Float32Array(N * 3), seed = new Float32Array(N);
+    const size = new Float32Array(N), kind = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      pos[i * 3] = rr(-SPAN / 2, SPAN / 2);
+      pos[i * 3 + 1] = 0;
+      pos[i * 3 + 2] = rr(-SPAN / 2, SPAN / 2);
+      seed[i] = rr(0, 100);
+      const dust = rnd() < 0.34;
+      kind[i] = dust ? 1 : 0;
+      size[i] = dust ? rr(0.5, 1.4) : rr(0.8, 3.0);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+    g.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+    g.setAttribute('aKind', new THREE.BufferAttribute(kind, 1));
+
+    this.mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      uniforms: uniformsFor(ctx.U, { uSpan: F(SPAN) }),
+      vertexShader: G + /* glsl */`
+        attribute float aSeed; attribute float aSize; attribute float aKind;
+        varying float vGlow; varying float vKind; varying vec3 vQ;
+        uniform float uSpan;
+        /* the dominant analytic terms of iceH(): enough for a sheet of snow that is
+           itself metres thick to hug the surface without a height texture */
+        float iceY(vec2 w){ float xc = w.x - (6.0 * sin(w.y * 0.012) + 2.5 * sin(w.y * 0.031 + 1.1));
+          return -w.y * 0.095 + 3.4 * exp(-xc * xc / 1800.0); }
+        void main(){
+          vec3 q = position;
+          vec2 w = gustAt(q) * (2.0 + 9.0 * uDrift);
+          q.xz += w * uTime * 3.0 + vec2(sin(uTime * 1.1 + aSeed), cos(uTime * 0.9 + aSeed * 1.7)) * 1.4;
+          vec2 c = cameraPosition.xz;
+          q.x = mod(q.x - c.x + uSpan * 0.5, uSpan) - uSpan * 0.5 + c.x;
+          q.z = mod(q.z - c.y + uSpan * 0.5, uSpan) - uSpan * 0.5 + c.y;
+          float f = fract(aSeed * 13.13);
+          float h = (aKind > 0.5)
+            ? 3.0 + 34.0 * f + 1.2 * sin(uTime * 0.4 + aSeed)                    /* diamond dust */
+            : 0.10 + 3.4 * f * f + 0.55 * sin(uTime * 1.9 + aSeed * 7.0);        /* spindrift sheet */
+          q.y = iceY(q.xz) + h;
+          vQ = q; vKind = aKind;
+          /* crystals flare only when they turn to the sun; blown snow is simply lit */
+          float flare = 0.5 + 0.5 * sin(uTime * 5.5 + aSeed * 31.0);
+          vGlow = (aKind > 0.5)
+            ? smoothstep(0.55, 1.0, flare) * (0.35 + 1.5 * uGlintI)
+            : (0.30 + 1.8 * uDrift) * (1.0 - 0.55 * smoothstep(0.0, 3.4, h));
+          vec4 mv = viewMatrix * vec4(q, 1.0);
+          /* grains, not lens smudges: clamp hard so a particle that drifts past the
+             near plane does not become a soft white disc across half the frame */
+          gl_PointSize = clamp(aSize * (26.0 / max(-mv.z, 1.0)) * (aKind > 0.5 ? 0.8 : 1.0), 1.0, 7.0);
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: G + /* glsl */`
+        varying float vGlow; varying float vKind; varying vec3 vQ;
+        void main(){
+          vec2 d = gl_PointCoord - 0.5;
+          float r = length(d);
+          /* dust is a hard spark with a cross flare; spindrift is a soft smear */
+          float a = (vKind > 0.5)
+            ? smoothstep(0.42, 0.0, r) + 0.35 * smoothstep(0.5, 0.0, min(abs(d.x), abs(d.y)) * 6.0)
+            : smoothstep(0.5, 0.0, r) * 0.85;
+          vec3 col = mix(mix(uSnowC, uSolarC, 0.45), vec3(0.78, 0.90, 1.0), 0.35 * vKind);
+          col *= (0.45 + 0.9 * uSolarI) * vGlow;
+          gl_FragColor = vec4(col * a, clamp(a * vGlow * 0.55, 0.0, 1.0) * aerialAtt(vQ));
+        ` + TAIL,
+    });
+
+    this.points = new THREE.Points(g, this.mat);
+    this.points.frustumCulled = false;
+    ctx.scene.add(this.points);
+  }
+  update() { /* motion is uTime/uGustV driven in the vertex shader */ }
+}
+
+// ---- camera.js ----
+
+/* ═══ COMPONENT: Camera ═══
+   A traverse UP the glacier: the rig walks the ice a little left of the medial
+   moraine so the rubble stripe runs away to the right, holds head height above the
+   shared field, and looks up-basin at the headwall with a shallow lift.
+
+   The lift is the whole framing decision. Point it further down and the frame is
+   nothing but snow, which in this world means an unreadable white sheet; point it
+   up and you lose the crevasses that give the surface its scale. A little under ten
+   degrees keeps the ice in the bottom half, the headwall across the middle, and a
+   band of that near-black zenith along the top — which is what makes the snow read
+   as blinding rather than merely pale. */
+class CameraRig {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.look = new THREE.Vector3();
+  }
+  update(dt, t) {
+    const { camera } = this.ctx;
+    // walk up-glacier and wrap, so the traverse never leaves the built basin
+    const span = 200;
+    const z = 104 - ((t * 2.6) % span);
+    const x = flowline(z) - 1.5 + 5.0 * Math.sin(t * 0.06);
+    // ride the lip, not the slot: take the highest of three samples so a crevasse
+    // passing under the rig does not drop the whole frame nine metres
+    const g = Math.max(iceH(x, z), iceH(x, z + 2.4), iceH(x, z - 2.4), iceH(x + 2.0, z));
+    camera.position.set(x, g + 1.85 + 0.10 * Math.sin(t * 1.1), z);
+
+    const zf = z - 36;
+    const xf = flowline(zf) + 2.5 * Math.sin(t * 0.045);
+    this.look.set(xf, iceH(xf, zf) + 3.5 + 1.2 * Math.sin(t * 0.08), zf);
+    camera.lookAt(this.look);
+    camera.rotation.z = 0.018 * Math.sin(t * 0.09);
+  }
+}
+
+const TRAVERSE = BASIN;   // the rig stays inside the basin the field defines
+
+// ---- postfx.js ----
+
+/* ═══ COMPONENT: PostFX ═══
+   Bloom + hand-written ACES pass (gamma + vignette); plain fallback if the
+   composer is unavailable. Contract boilerplate (SCENE_CONTRACT §11). */
+class PostFX {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { renderer, scene, camera } = ctx;
+    try {
+      this.composer = new EffectComposer(renderer); this.composer.addPass(new RenderPass(scene, camera));
+      this.bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.4, 0.45, 0.92); this.composer.addPass(this.bloom);
+      this.out = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uExposure: F(1) }, vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform sampler2D tDiffuse; uniform float uExposure; varying vec2 vUv;
+        vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+        void main(){ vec3 c = texture2D(tDiffuse, vUv).rgb * uExposure; c = aces(c); float v = 1.0 - 0.28 * pow(length(vUv - 0.5) * 1.35, 2.5);
+          gl_FragColor = vec4(pow(c * v, vec3(1.0 / 2.2)), 1.0); }` });
+      this.composer.addPass(this.out); renderer.toneMapping = THREE.NoToneMapping;
+    } catch (e) { console.warn('post-processing unavailable, plain render', e); this.composer = null; }
+  }
+  resize(w, h) { if (this.composer) { this.composer.setSize(w, h); this.bloom.setSize(w, h); } }
+  render() {
+    const { renderer, scene, camera, cur } = this.ctx;
+    if (this.composer) { this.bloom.strength = cur.bloom; this.out.uniforms.uExposure.value = cur.exposure; this.composer.render(); }
+    else { renderer.toneMappingExposure = cur.exposure; renderer.render(scene, camera); }
+  }
+}
+
+// ---- scene.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE: Glacier — a high alpine basin under an inverted exposure range.
+   Everything here is bright and the contrast is low: snow throws light back UP
+   into every shadow, and the ice is translucent, so shadows go blue and filled
+   rather than black. Enumerated manifest: four named states, chosen to move the
+   LIGHTING MODEL and not merely the palette — the ratio of direct sun to sky
+   dome to upwash, how deep light travels into the ice, and how much of the
+   direction is left in the light at all.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const STATES = {
+  'blue-dawn': {
+    caption: 'The sun has not cleared the headwall. Every photon in the basin has come off the sky, so the snow is the colour of the sky — and the crevasses, lit from inside by nothing, are the only warm thing left.',
+    airC: [0.62, 0.72, 0.92], airD: 0.0026, zenithC: [0.06, 0.15, 0.44],
+    domeC: [0.50, 0.66, 1.00], domeI: 0.30, upwashC: [0.52, 0.68, 1.00], upwashI: 0.26,
+    solarC: [0.62, 0.72, 1.00], solarI: 0.10, solarEl: -0.055, solarAz: 2.42,
+    snowC: [0.84, 0.90, 1.00], iceC: [0.16, 0.48, 0.92], moraineC: [0.30, 0.31, 0.36],
+    iceDepth: 0.34, glare: 0.15, whiteout: 0.04, glint: 0.18, crevasse: 1.0, drift: 0.16,
+    halo: 0.0, alpen: 0.06, lichenD: 0.30, gustX: 0.05, gustZ: 0.16, ravenSpeed: 0.45,
+    bloom: 0.20, exposure: 0.92 },
+  'white-noon': {
+    caption: 'Noon at three and a half thousand metres. The sun is a hole in the sky, the snow gives most of it straight back up, and there is nowhere in the basin dark enough to rest your eye.',
+    airC: [0.88, 0.93, 1.00], airD: 0.0021, zenithC: [0.05, 0.16, 0.52],
+    domeC: [0.72, 0.84, 1.00], domeI: 0.24, upwashC: [0.90, 0.95, 1.00], upwashI: 0.30,
+    solarC: [1.00, 0.985, 0.95], solarI: 0.84, solarEl: 0.58, solarAz: 2.50,
+    snowC: [0.96, 0.97, 1.00], iceC: [0.20, 0.60, 1.00], moraineC: [0.36, 0.35, 0.37],
+    iceDepth: 0.52, glare: 1.00, whiteout: 0.0, glint: 1.00, crevasse: 1.0, drift: 0.30,
+    halo: 0.30, alpen: 0.0, lichenD: 0.55, gustX: 0.10, gustZ: 0.30, ravenSpeed: 1.0,
+    bloom: 0.40, exposure: 0.74 },
+  'whiteout': {
+    caption: 'Cloud has come up the valley and filled the basin. The light arrives from every direction at once, which is the same as arriving from none: the surface loses its shadows, and with them any way of telling a step from a hole.',
+    airC: [0.84, 0.88, 0.93], airD: 0.0062, zenithC: [0.66, 0.72, 0.82],
+    domeC: [0.90, 0.94, 1.00], domeI: 0.34, upwashC: [0.92, 0.95, 1.00], upwashI: 0.26,
+    solarC: [0.94, 0.95, 0.97], solarI: 0.30, solarEl: 0.78, solarAz: 1.55,
+    snowC: [0.94, 0.95, 0.98], iceC: [0.42, 0.62, 0.86], moraineC: [0.42, 0.42, 0.44],
+    iceDepth: 0.20, glare: 0.10, whiteout: 0.88, glint: 0.08, crevasse: 0.55, drift: 1.00,
+    halo: 0.0, alpen: 0.0, lichenD: 0.70, gustX: 0.55, gustZ: 0.85, ravenSpeed: 0.7,
+    bloom: 0.26, exposure: 0.70 },
+  'alpenglow': {
+    caption: 'The last sun comes in almost level, red, and grazing. The snow takes the red and the shadows keep the sky, so the whole basin splits into two colours and a halo stands up around the sun.',
+    airC: [0.94, 0.66, 0.58], airD: 0.0034, zenithC: [0.08, 0.14, 0.40],
+    domeC: [0.42, 0.56, 0.96], domeI: 0.30, upwashC: [0.98, 0.72, 0.66], upwashI: 0.28,
+    solarC: [1.00, 0.52, 0.36], solarI: 0.90, solarEl: 0.075, solarAz: 2.62,
+    snowC: [0.96, 0.92, 0.94], iceC: [0.22, 0.52, 0.98], moraineC: [0.40, 0.31, 0.29],
+    iceDepth: 0.46, glare: 0.62, whiteout: 0.02, glint: 0.55, crevasse: 1.0, drift: 0.22,
+    halo: 0.85, alpen: 1.00, lichenD: 0.40, gustX: 0.06, gustZ: 0.20, ravenSpeed: 0.6,
+    bloom: 0.50, exposure: 0.88 },
+};
+const ORDER = Object.keys(STATES);
+const isColor = (k) => Array.isArray(STATES[ORDER[0]][k]);
+
+const sceneDef = {
+  meta: { fov: 58, near: 0.1, far: 1600, pixelRatio: 1.5, rate: 1.1, seed: 11, toneMapping: 'ACESFilmicToneMapping' },
+
+  buildUniforms() {
+    return {
+      uTime: F(0),
+      uAirC: C3(), uAirD: F(0.003),
+      uZenithC: C3(), uDomeC: C3(), uDomeI: F(0.3),
+      uSolarV: V3(0, -1, 0), uSolarC: C3(), uSolarI: F(0.5),
+      uUpwashC: C3(), uUpwashI: F(0.28),
+      uSnowC: C3(), uIceC: C3(), uMoraineC: C3(),
+      uIceDepth: F(0.4), uGlareI: F(0.6), uWhiteout: F(0), uGlintI: F(0.6),
+      uCrevasse: F(1), uDrift: F(0.3), uHaloI: F(0), uAlpenI: F(0), uLichenD: F(0.5),
+      uEdgeX: F(EDGE), uCrestY: F(CREST),
+      uGustV: { value: new THREE.Vector2(0.1, 0.3) },
+    };
+  },
+
+  initialState() { const h = location.hash.slice(1); return STATES[h] ? h : ORDER[0]; },
+
+  resolveState(name) {
+    const s = STATES[STATES[name] ? name : ORDER[0]];
+    const t = {};
+    for (const k in s) { if (k === 'caption') continue; t[k] = isColor(k) ? new THREE.Color(...s[k]) : s[k]; }
+    return t;
+  },
+
+  applyToUniforms(cur, ctx) {
+    const U = ctx.U;
+    U.uAirC.value.copy(cur.airC); U.uAirD.value = cur.airD;
+    U.uZenithC.value.copy(cur.zenithC);
+    U.uDomeC.value.copy(cur.domeC); U.uDomeI.value = cur.domeI;
+    U.uSolarC.value.copy(cur.solarC); U.uSolarI.value = cur.solarI;
+    U.uUpwashC.value.copy(cur.upwashC); U.uUpwashI.value = cur.upwashI;
+    U.uSnowC.value.copy(cur.snowC); U.uIceC.value.copy(cur.iceC); U.uMoraineC.value.copy(cur.moraineC);
+    U.uIceDepth.value = cur.iceDepth; U.uGlareI.value = cur.glare; U.uWhiteout.value = cur.whiteout;
+    U.uGlintI.value = cur.glint; U.uCrevasse.value = cur.crevasse; U.uDrift.value = cur.drift;
+    U.uHaloI.value = cur.halo; U.uAlpenI.value = cur.alpen; U.uLichenD.value = cur.lichenD;
+    U.uGustV.value.set(cur.gustX, cur.gustZ);
+    // sun direction from elevation/azimuth: this is the vector every layer shades against
+    const ce = Math.cos(cur.solarEl);
+    U.uSolarV.value.set(-ce * Math.sin(cur.solarAz), -Math.sin(cur.solarEl), -ce * Math.cos(cur.solarAz)).normalize();
+  },
+
+  setup(ctx) { ctx.scene.background = ctx.U.uAirC.value; },
+
+  layers: [Aether, Icefield, Lichen, Ravens, Spindrift],
+  camera: CameraRig,
+  postfx: PostFX,
+
+  onHashChange(sm) { const name = STATES[location.hash.slice(1)] ? location.hash.slice(1) : ORDER[0]; sm.setState(name); showState(name); },
+
+  setupUI(ctx, sm) {
+    captionEl = document.getElementById('caption'); nav = document.getElementById('nav');
+    ORDER.forEach((n) => { const b = document.createElement('button'); b.textContent = n; b.dataset.state = n; b.addEventListener('click', () => { location.hash = n; }); nav.appendChild(b); });
+    showState(sceneDef.initialState(), true);
+  },
+};
+
+// ---- caption + nav (module-scoped, wired in setupUI) ----
+let captionEl, nav;
+function showState(name, instant = false) {
+  nav.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.state === name));
+  captionEl.classList.add('fade');
+  setTimeout(() => { captionEl.textContent = STATES[name].caption; captionEl.classList.remove('fade'); }, instant ? 0 : 500);
+}
+
+boot(document.getElementById('scene'), sceneDef);
+
+</script>
+</body>
+</html>

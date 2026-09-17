@@ -1,0 +1,1278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Citynight — a rain-wet street under its own lights</title>
+<meta name="states" content="dry-dusk,neon-rain,after-midnight,fog-halo" />
+<style>
+  :root { --ink: #e6f2f0; --ink-dim: rgba(230,242,240,.42); --ink-mid: rgba(230,242,240,.74); --hairline: rgba(230,242,240,.16); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #041418; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; color: var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #ui::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 220px; background: linear-gradient(transparent, rgba(2,10,14,.55)); z-index: -1; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 22px 28px; }
+  .mark { font-size: 12px; font-weight: 500; letter-spacing: .34em; text-shadow: 0 1px 8px rgba(0,0,0,.5); }
+  .mark small { letter-spacing: .2em; font-weight: 400; color: var(--ink-dim); margin-left: 1.2em; font-size: 10px; }
+  .hint { font-size: 10px; letter-spacing: .12em; color: var(--ink-dim); }
+  footer { padding: 0 28px 26px; max-width: 720px; }
+  #caption { font-family: Georgia, "Times New Roman", serif; font-style: italic; font-size: 18px; line-height: 1.45; color: var(--ink-mid);
+    text-shadow: 0 1px 10px rgba(0,0,0,.6); min-height: 2.9em; transition: opacity .6s; }
+  #caption.fade { opacity: 0; }
+  nav { display: flex; gap: 8px; margin-top: 16px; pointer-events: auto; flex-wrap: wrap; }
+  nav button { appearance: none; background: transparent; border: 1px solid var(--hairline); color: var(--ink-dim); font: inherit; font-size: 10px;
+    letter-spacing: .2em; text-transform: uppercase; padding: 8px 14px; border-radius: 16px; cursor: pointer; transition: all .4s; backdrop-filter: blur(6px); }
+  nav button:hover { color: var(--ink); border-color: rgba(230,242,240,.4); }
+  nav button.on { color: #061418; background: rgba(190, 232, 226, .9); border-color: transparent; }
+  @media (max-width: 560px) { #caption { font-size: 15px; } }
+</style>
+<script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="ui">
+  <header><div class="mark">CITYNIGHT <small>WET ASPHALT</small></div><div class="hint">#state in the URL selects a scene</div></header>
+  <footer><div id="caption"></div><nav id="nav"></nav></footer>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ---- ../contract/runtime.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE CONTRACT — shared runtime (v1)
+   The scene-agnostic engine every scene boots against. See SCENE_CONTRACT.md.
+   Provides: uniform helpers, a seeded RNG, a state machine (enumerated OR
+   factored manifest), and the assembler loop. A scene supplies a `sceneDef`
+   (uniforms, layer classes, camera, state resolver, per-frame apply) to boot().
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* uniform helpers — a ShaderMaterial's uniforms is uniformsFor({...locals}) */
+const F  = (v) => ({ value: v });
+const C3 = () => ({ value: new THREE.Color() });
+const V3 = (x = 0, y = 0, z = 0) => ({ value: new THREE.Vector3(x, y, z) });
+const uniformsFor = (U, extra = {}) => ({ ...U, ...extra });
+
+/* deterministic RNG (park–miller); no Math.random in scene code */
+function makeRNG(seed = 7) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  const rr = (a, b) => a + (b - a) * rnd();
+  return { rnd, rr };
+}
+
+/* cur → target exponential interpolation of every visual parameter.
+   `resolve(name)` returns a fresh target object (numbers, THREE.Color, THREE.Vector3).
+   Colors/Vectors lerp via .lerp; numbers lerp arithmetically. */
+class StateMachine {
+  constructor({ initial, resolve, rate = 1.2, onApply }) {
+    this.resolve = resolve; this.rate = rate; this.onApply = onApply;
+    this.cur = {}; this.target = {};
+    this.setState(initial, true);
+  }
+  setState(name, instant = false) {
+    const t = this.resolve(name);
+    for (const k in t) if (!(k in this.cur)) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+    this.target = t;
+    if (instant) for (const k in t) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+  }
+  tick(dt, t, ctx) {
+    const k = 1 - Math.exp(-dt * this.rate), cur = this.cur, tg = this.target;
+    for (const key in tg) {
+      const c = cur[key], target = tg[key];
+      if (typeof c === 'number') cur[key] = c + (target - c) * k;
+      else if (c && c.lerp) c.lerp(target, k);
+    }
+    if (this.onApply) this.onApply(cur, ctx, t);
+  }
+}
+
+/* boot the frozen skeleton: renderer, scene, camera, layers[], main loop.
+   sceneDef: { meta, buildUniforms(), resolveState(name), initialState(),
+               applyToUniforms(cur,ctx,t), layers:[Class], camera:Class,
+               postfx?:Class, setupUI?(ctx,sm), onHashChange?(sm) } */
+function boot(canvas, sceneDef) {
+  const meta = sceneDef.meta || {};
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, meta.pixelRatio ?? 2));
+  renderer.setSize(innerWidth, innerHeight);
+  if (meta.toneMapping && THREE[meta.toneMapping]) renderer.toneMapping = THREE[meta.toneMapping];
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(meta.fov ?? 55, innerWidth / innerHeight, meta.near ?? 0.5, meta.far ?? 10000);
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const { rnd, rr } = makeRNG(meta.seed ?? 7);
+  const U = sceneDef.buildUniforms();
+  const ctx = { THREE, renderer, scene, camera, U, rnd, rr, reducedMotion, cur: null };
+
+  const sm = new StateMachine({
+    initial: sceneDef.initialState(),
+    resolve: (name) => sceneDef.resolveState(name),
+    rate: meta.rate ?? 1.2,
+    onApply: (cur, c, t) => sceneDef.applyToUniforms(cur, c, t),
+  });
+  ctx.cur = sm.cur;
+
+  // scene-level setup (background, renderer tweaks) before layers are built
+  if (sceneDef.setup) sceneDef.setup(ctx);
+
+  const layers = (sceneDef.layers || []).map((L) => new L(ctx));
+  const rig = sceneDef.camera ? new sceneDef.camera(ctx) : null;
+  const post = sceneDef.postfx ? new sceneDef.postfx(ctx) : null;
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); if (post && post.resize) post.resize(innerWidth, innerHeight);
+  });
+  addEventListener('hashchange', () => sceneDef.onHashChange ? sceneDef.onHashChange(sm) : sm.setState(location.hash.slice(1)));
+  if (sceneDef.setupUI) sceneDef.setupUI(ctx, sm);
+
+  const clock = new THREE.Clock(); let t = 0;
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05); t += dt;
+    U.uTime.value = t;
+    sm.tick(dt, t, ctx);
+    if (rig) rig.update(dt, t, ctx);
+    for (const l of layers) if (l.update) l.update(dt, t);
+    if (post) post.render(); else renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+  return { ctx, sm, layers, rig, post };
+}
+
+// ---- field.js ----
+
+// Street layout for citynight. The CPU noise here mirrors the GLSL noise in the
+// prelude so the road mesh, the weeds in the cracks, the pedestrians on the
+// pavement and the camera all agree about where the ground is.
+//
+// This world has no sun. Its light comes from a LATTICE of fixtures standing in
+// the street — sodium lamps, vertical neon signs, lit shopfronts — so the layout
+// of those fixtures is a geometry constant like any other, and lives here.
+
+const BLOCK = 240;        // the street runs along z: |z| <= BLOCK/2
+const KERB_X = 7.0;       // roadway half-width — the kerb line
+const FACE_X = 12.6;      // building frontage stands here
+const KERB_Y = 0.34;      // pavement height above the road crown
+const FIX_SP = 15.0;      // fixture spacing along the street
+const NLAMP = 10;         // emitter slots the shaders read (== #define NLAMP in prelude.glsl.js)
+
+const hashC = (x, y, z) => { const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return s - Math.floor(s); };
+const mixC = (a, b, t) => a + (b - a) * t;
+function vnoiseC(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z); let xf = x - xi, yf = y - yi, zf = z - zi;
+  xf = xf * xf * (3 - 2 * xf); yf = yf * yf * (3 - 2 * yf); zf = zf * zf * (3 - 2 * zf);
+  const c = (dy, dz) => mixC(hashC(xi, yi + dy, zi + dz), hashC(xi + 1, yi + dy, zi + dz), xf);
+  return mixC(mixC(c(0, 0), c(1, 0), yf), mixC(c(0, 1), c(1, 1), yf), zf);
+}
+function fbmC(x, y, z, o = 3) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < o; i++) { s += a * vnoiseC(x, y, z); x = x * 2.03 + 1.3; y = y * 2.01 + 0.7; z = z * 1.97 + 2.1; a *= 0.5; }
+  return s;
+}
+const sstep = (t) => { t = Math.min(1, Math.max(0, t)); return t * t * (3 - 2 * t); };
+
+// domain: |x| <= 16, |z| <= BLOCK/2; range: 0 in the gutter up to KERB_Y+0.06 at
+// the shopfronts. Owned by Blacktop; sampled by Kerbside, Passersby and CameraRig.
+const streetH = (x, z) => {
+  const ax = Math.abs(x);
+  const wear = 0.055 * (fbmC(x * 0.55, 0.5, z * 0.55, 3) - 0.5);
+  if (ax <= KERB_X) {                                   // cambered carriageway, water runs to the gutter
+    const t = ax / KERB_X;
+    return 0.20 * (1 - t * t) - 0.09 * sstep((t - 0.84) / 0.16) + wear;
+  }
+  if (ax <= KERB_X + 0.3) return KERB_Y * sstep((ax - KERB_X) / 0.3) + wear * 0.4;   // the kerb face
+  if (ax <= FACE_X) return KERB_Y + 0.05 * (ax - KERB_X - 0.3) / (FACE_X - KERB_X) + wear * 0.5;
+  return KERB_Y + 0.06;                                 // under the frontage
+};
+
+const onWalk = (x, z) => { const ax = Math.abs(x); return ax > KERB_X + 0.7 && ax < FACE_X - 0.7; };
+
+// ── the light fixtures ────────────────────────────────────────────────────────
+// kind 0 sodium lamp on a bracket over the road, 1 vertical neon sign bolted to a
+// frontage, 2 a lit shopfront box at street level. Staggered left/right so the two
+// pavements never carry the same thing at the same z.
+const NEON = [
+  [1.00, 0.16, 0.46], [0.20, 0.92, 1.00], [0.34, 1.00, 0.50],
+  [1.00, 0.40, 0.10], [0.50, 0.42, 1.00], [1.00, 0.82, 0.26],
+];
+
+function buildFixtures() {
+  const out = [];
+  const kMax = Math.floor(BLOCK / (2 * FIX_SP));
+  for (let k = -kMax; k <= kMax; k++) {
+    for (let s = -1; s <= 1; s += 2) {
+      const z = k * FIX_SP + (s > 0 ? FIX_SP * 0.5 : 0);
+      const h = hashC(k * 3.7, s * 1.9, 0.5), h2 = hashC(k * 1.3, s * 5.1, 2.5);
+      const kind = (k * 2 + (s > 0 ? 1 : 0) + 9) % 3;
+      if (kind === 0) {
+        out.push({ kind: 0, x: s * (KERB_X - 0.5), y: 6.3, z, side: s, postX: s * (KERB_X + 0.8),
+          c: [1.00, 0.60, 0.22], i: 1.0, sx: 0.8, sy: 0.26, sz: 0.5 });
+      } else if (kind === 1) {
+        out.push({ kind: 1, x: s * (FACE_X - 1.30), y: 3.9 + h * 3.6, z, side: s, postX: 0,
+          c: NEON[Math.floor(h2 * NEON.length) % NEON.length], i: 1.1 + 0.7 * h,
+          sx: 0.5, sy: 1.6 + h * 1.6, sz: 1.2 });
+      } else {
+        out.push({ kind: 2, x: s * (FACE_X - 0.18), y: 2.0, z, side: s, postX: 0,
+          c: h2 > 0.55 ? [1.00, 0.90, 0.66] : [0.62, 1.00, 0.86], i: 0.42,
+          sx: 0.22, sy: 1.5, sz: 3.2 });
+      }
+    }
+  }
+  return out;
+}
+const FIXTURES = buildFixtures();
+
+const UP = new THREE.Vector3(0, 1, 0);
+
+// ---- prelude.glsl.js ----
+
+// Citynight GLSL prelude. G = core noise + this world's fields: the emitter array
+// that stands in for a sun, the water film on the road, and the sodium murk in the
+// air. VERT_WORLD / FRAG_TARMAC / FRAG_BRICK are the bases every other material
+// derives from by string-surgery. TAIL is the tonemap/colorspace close.
+//
+// The distinctive field here is the uEmi* array. There is no uSunDir: light arrives
+// from NLAMP point sources at street level, each with its own colour, and the road
+// is a mirror that doubles every one of them. A layer that shades against a single
+// key direction will look like it was lit in a different world.
+
+const G = /* glsl */`
+#define NLAMP 10
+uniform float uTime;
+uniform vec3 uEmiP[NLAMP];            /* world position of each artificial source */
+uniform vec3 uEmiC[NLAMP];            /* its colour — sodium amber, neon, shopfront white */
+uniform float uEmiI[NLAMP];           /* its output; 0 means the slot is unused */
+uniform vec3 uMurkC; uniform float uMurkD;
+uniform vec3 uGlowC; uniform float uGlowI;      /* the overcast lid, lit from below by the city */
+uniform vec3 uNeonC;                  /* the dominant sign colour — what the wet air takes on */
+uniform float uNeonI;                 /* master gain on every artificial source */
+uniform float uLampI;                 /* sodium output */
+uniform float uSignI;                 /* neon + shopfront output */
+uniform vec3 uWinC; uniform float uWinI; uniform float uWinOcc;
+uniform vec3 uTarC; uniform float uGrime;
+uniform float uWetness;               /* 0 dry tarmac .. 1 standing water */
+uniform float uRipple;                /* how hard the rain chops the film up */
+uniform float uRainAmt; uniform float uHaloR; uniform float uStarI;
+uniform float uKerbX; uniform float uFaceX;
+uniform vec2 uGust;
+
+float hash1(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+vec2 hash2(vec2 p){ return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
+float noise3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash1(i), hash1(i+vec3(1,0,0)), f.x), mix(hash1(i+vec3(0,1,0)), hash1(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash1(i+vec3(0,0,1)), hash1(i+vec3(1,0,1)), f.x), mix(hash1(i+vec3(0,1,1)), hash1(i+vec3(1,1,1)), f.x), f.y), f.z); }
+const mat3 TUMBLE = mat3(0.36, 0.48, -0.8, -0.8, 0.6, 0.0, 0.48, 0.64, 0.6);
+float fbm3(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * noise3(p); p = TUMBLE * p * 2.03 + 1.7; a *= 0.5; } return s; }
+float fbm2(vec2 p){ return fbm3(vec3(p, 0.37)); }
+
+/* where the water actually stands: broad pools smeared along the street, found
+   only in the low camber and the gutters. 0 on the pavement, 1 in a puddle. */
+float puddleMask(vec3 p){
+  float b = fbm2(p.xz * vec2(0.24, 0.085) + 3.7);
+  float low = smoothstep(0.30, 0.02, p.y);
+  return smoothstep(0.44, 0.64, b) * low * uWetness;
+}
+
+/* one lattice of spreading raindrop rings on standing water */
+float ringsAt(vec2 q, float ph){
+  vec2 i = floor(q), f = fract(q) - 0.5;
+  vec2 c = (hash2(i + ph) - 0.5) * 0.7;
+  float t = fract(uTime * 1.25 + hash2(i + ph + 5.0).y);
+  return smoothstep(0.045, 0.0, abs(length(f - c) - t * 0.45)) * (1.0 - t);
+}
+float dropRings(vec2 q){ return (ringsAt(q, 0.0) + ringsAt(q * 1.7 + 3.1, 2.0)) * uRainAmt; }
+
+/* the normal of the water film: near-mirror, chopped by wind chop and by the rings
+   the rain punches into it. This is what smears a sign into a streak. */
+vec3 slickN(vec3 p, vec3 n){
+  vec2 q = p.xz * vec2(2.4, 1.1); float e = 0.30;
+  float d0 = fbm2(q + uTime * 0.6);
+  vec2 chop = vec2(d0 - fbm2(q + vec2(e, 0.0) + uTime * 0.6),
+                   fbm2(q + vec2(0.0, e) + uTime * 0.6) - d0);
+  float r = dropRings(p.xz * 1.15);
+  return normalize(n + vec3(chop.x, 0.0, chop.y) * (0.5 + 3.0 * r) * uRipple);
+}
+
+/* the sum of every artificial source falling on a surface. This replaces the sun:
+   a wrapped diffuse term so nothing facing away goes absolutely black, and an
+   inverse-square falloff so a figure standing under a sign is lit by that sign. */
+vec3 neonGlow(vec3 p, vec3 n){
+  vec3 acc = vec3(0.0);
+  for (int i = 0; i < NLAMP; i++){
+    vec3 d = uEmiP[i] - p; float r = length(d);
+    acc += uEmiC[i] * (uEmiI[i] / (1.0 + 0.34 * r * r)) * (0.04 + 0.96 * max(dot(n, d / max(r, 0.001)), 0.0));
+  }
+  return acc * uNeonI;
+}
+
+/* and the same sources seen IN the road rather than on it — the mirror image of
+   every light, stretched by the chop into a vertical streak. The signature of
+   this world: kill this term and a rain-wet street reads as dry grey tarmac. */
+vec3 wetSpec(vec3 p, vec3 n){
+  vec3 V = normalize(cameraPosition - p);
+  vec3 R = reflect(-V, n);
+  vec2 rh = R.xz / max(length(R.xz), 0.001);
+  /* the lobe is deliberately ANISOTROPIC: narrow across the street, long along it.
+     That is what turns a point source into the streak you actually see lying in a
+     wet road. An isotropic highlight gives you a dot, and a dot is not a world. */
+  float across = mix(40.0, 700.0, uWetness);
+  float along = mix(16.0, 3.2, uWetness);
+  vec3 acc = vec3(0.0);
+  for (int i = 0; i < NLAMP; i++){
+    vec3 d = uEmiP[i] - p; float r = length(d); vec3 L = d / max(r, 0.001);
+    float az = dot(rh, L.xz / max(length(L.xz), 0.001));
+    float el = R.y - L.y;
+    acc += uEmiC[i] * uEmiI[i] * pow(max(az, 0.0), across) * exp(-el * el * along) / (1.0 + 0.05 * r * r);
+  }
+  float fres = pow(1.0 - clamp(dot(n, V), 0.0, 1.0), 4.0);   /* a mirror at a grazing angle, tar straight down */
+  return acc * (0.06 + 0.95 * fres) * (0.15 + 0.85 * uWetness) * 0.42;
+}
+
+/* the only "sky" light there is: sodium bounced off the cloud lid and back down. */
+vec3 skyBounce(vec3 n){ return uGlowC * uGlowI * (0.32 + 0.68 * clamp(n.y * 0.5 + 0.5, 0.0, 1.0)); }
+
+/* wet air: thickens with the rain, and takes the colour of the signs it hangs in. */
+vec3 murk(vec3 col, vec3 p){
+  float d = distance(p, cameraPosition);
+  float k = uMurkD * (1.0 + 0.8 * uRainAmt);
+  vec3 m = uMurkC * mix(vec3(1.0), uNeonC, 0.18 * uHaloR) * (0.80 + 0.35 * uHaloR);
+  return mix(col, m, clamp(1.0 - exp(-d * d * k * k), 0.0, 1.0));
+}
+float murkAtt(vec3 p){ float d = distance(p, cameraPosition);
+  float k = uMurkD * (1.0 + 0.8 * uRainAmt); return exp(-d * d * k * k); }
+
+/* wind funnelled down the street: slants the rain and shakes the street trees. */
+vec2 gustAt(vec3 p){ return uGust * (0.7 + 0.6 * fbm2(p.xz * 0.05 + uTime * 0.11)); }
+`;
+
+const VERT_WORLD = /* glsl */`
+varying vec3 vP, vN; uniform float uSway; uniform float uTime; uniform vec2 uGust;
+void main(){
+  #ifdef USE_INSTANCING
+  mat4 m = modelMatrix * instanceMatrix;
+  #else
+  mat4 m = modelMatrix;
+  #endif
+  vec4 wp = m * vec4(position, 1.0);
+  if (uSway > 0.0) { float s = clamp(wp.y / 5.0, 0.0, 1.0); s *= s;
+    wp.xz += uSway * s * (uGust * 0.9 + vec2(sin(uTime * 1.9 + wp.z * 0.45), cos(uTime * 1.5 + wp.x * 0.55)) * 0.28); }
+  vP = wp.xyz; vN = normalize(mat3(m) * normal); gl_Position = projectionMatrix * viewMatrix * wp; }`;
+
+/* The road, the kerb and the pavement in one shader: dry aggregate where the water
+   has run off, a chopped mirror where it has not, and painted lines so the surface
+   reads as a carriageway and not as grey ground. */
+const FRAG_TARMAC = G + /* glsl */`
+varying vec3 vP, vN; uniform float uAggr;
+void main(){ vec3 p = vP; vec3 g = normalize(vN);
+  float ax = abs(p.x);
+  vec3 bump = vec3(noise3(p * 7.0) - 0.5, 0.0, noise3(p * 7.0 + 4.0) - 0.5) * 0.50
+            + vec3(noise3(p * 26.0) - 0.5, 0.0, noise3(p * 26.0 + 7.0) - 0.5) * 0.20;
+  vec3 nd = normalize(g + bump * uAggr);
+  float pool = puddleMask(p);
+  float wet = clamp(pool + 0.34 * uWetness, 0.0, 1.0);
+  vec3 n = normalize(mix(nd, slickN(p, g), wet));
+
+  vec3 base = uTarC * (0.78 + 0.34 * fbm3(p * 1.7) + 0.16 * noise3(p * 14.0));
+  if (ax > uKerbX) {                                    /* flagstone pavement */
+    vec2 c = vec2(p.x, p.z) / vec2(1.6, 1.95);
+    vec2 j = abs(fract(c) - 0.5);
+    float joint = smoothstep(0.42, 0.50, max(j.x, j.y));
+    base = mix(vec3(0.34, 0.335, 0.33), vec3(0.11, 0.11, 0.12), joint) * (0.72 + 0.55 * fbm3(p * 1.4));
+  } else {                                              /* carriageway paint */
+    float dash = smoothstep(0.17, 0.10, ax) * step(0.55, fract(p.z * 0.19));
+    float edge = smoothstep(0.22, 0.14, abs(ax - (uKerbX - 0.7)));
+    float paint = clamp(dash + edge, 0.0, 1.0) * (0.45 + 0.55 * fbm2(p.xz * 2.6));
+    base = mix(base, vec3(0.70, 0.66, 0.50), paint * (1.0 - 0.4 * uGrime));
+  }
+  base *= 1.0 - 0.30 * uGrime;
+  base = mix(base, base * 0.15, wet * 0.92);             /* wet stone is dark stone */
+
+  vec3 lit = base * (skyBounce(n) + neonGlow(p, n)) + wetSpec(p, n) * mix(0.10, 1.0, wet);
+  lit += uEmiC[0] * uEmiI[0] * 0.006 * dropRings(p.xz * 1.15) * pool;   /* ring crests catch a highlight */
+  gl_FragColor = vec4(murk(lit, p), 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+/* Frontage: soot-dark masonry carrying a grid of windows, some of them lit. The
+   windows are the other half of this world's lighting — hundreds of small warm
+   sources stacked above the street. aFace = (seed, lit fraction, storey offset). */
+const FRAG_BRICK = G + /* glsl */`
+varying vec3 vP, vN; varying vec3 vFace; uniform vec3 uBrickC; uniform float uPane;
+void main(){ vec3 p = vP; vec3 n = normalize(vN);
+  vec2 fc = (abs(n.x) > 0.5) ? vec2(p.z, p.y) : vec2(p.x, p.y);
+  vec2 cu = vec2(fc.x / 2.45, (fc.y - 2.6 - vFace.z) / 3.15);
+  vec2 cell = floor(cu), f = fract(cu);
+
+  /* How big is one window cell on screen? fwidth() answers that directly, in cell
+     units per pixel. Below ~0.5 the grid is finer than the pixel grid sampling it,
+     which is the Nyquist limit: drawn crisply it moires, and the moire crawls as the
+     camera moves, which reads as flicker rather than as detail. View angle and
+     distance are only proxies for this quantity - they miss the dependence on FOV,
+     resolution and the pattern's own scale, so they under-correct exactly where it
+     matters most. Measure the footprint instead, and widen the pane edges by it so
+     the edges filter themselves instead of shimmering. */
+  vec2 w = fwidth(cu);
+  float foot = max(w.x, w.y);
+  float res = smoothstep(0.62, 0.18, foot);          /* 1 = resolvable, 0 = sub-pixel */
+  float ax = clamp(w.x * 1.4, 0.0, 0.34), ay = clamp(w.y * 1.4, 0.0, 0.30);
+  float pane = smoothstep(0.14 - ax, 0.22 + ax, f.x) * smoothstep(0.86 + ax, 0.78 - ax, f.x)
+             * smoothstep(0.24 - ay, 0.32 + ay, f.y) * smoothstep(0.88 + ay, 0.80 - ay, f.y);
+  float r = hash1(vec3(cell, vFace.x * 37.0));
+  float on = step(1.0 - vFace.y * uWinOcc * uPane, r) * step(3.2, fc.y);
+  float tv = 1.0 + 0.55 * step(0.90, fract(r * 13.0)) * sin(uTime * 6.5 + r * 40.0);
+  vec3 wc = mix(uWinC, vec3(0.52, 0.72, 1.00), step(0.78, fract(r * 7.0)));
+  vec3 emis = wc * uWinI * pane * on * tv;
+
+  /* brick courses alias for the same reason; fade them out once a course is sub-pixel */
+  float course = 0.95 + 0.05 * sin(fc.y * 12.0) * smoothstep(0.5, 0.12, fwidth(fc.y) * 12.0);
+  float streak = 0.80 + 0.36 * fbm2(vec2(fc.x * 0.9, fc.y * 0.08));  /* rain runs down the render */
+  float soot = 0.55 + 0.6 * fbm3(p * 0.55) - 0.35 * smoothstep(14.0, 2.0, p.y) * uGrime;
+  vec3 wall = uBrickC * course * streak * (0.7 + 0.7 * fract(vFace.x * 5.0)) * clamp(soot, 0.15, 1.6);
+
+  /* the ground floor is glazed, not bricked: a band of shopfront between mullions,
+     dark where the shutters are down and lit where they are not */
+  float shop = smoothstep(3.3, 3.0, fc.y) * smoothstep(0.25, 0.55, fc.y);
+  float bay = fract(fc.x / 1.7);
+  float mull = smoothstep(0.10, 0.17, bay) * smoothstep(0.93, 0.86, bay);
+  float shopOn = clamp(step(0.40, hash1(vec3(floor(fc.x / 1.7), 3.0, vFace.x * 11.0))) * uWinOcc * 2.4, 0.0, 1.0);
+  wall = mix(wall, wall * 0.30, shop);
+  emis += uWinC * uWinI * 0.55 * shop * mull * shopOn;
+
+  /* Collapse the grid into its own average wherever it can no longer be drawn
+     honestly. res is the measured footprint test above, not a proxy for it, so the
+     crossover lands where the aliasing actually starts regardless of FOV or distance.
+     (No backticks in this file: every shader here lives inside a JS template literal,
+     and one stray backtick ends the literal and breaks the whole module.) */
+  vec3 soft = uWinC * uWinI * uWinOcc * vFace.y * (0.26 * step(3.2, fc.y) + 0.22 * shop);
+  emis = mix(soft, emis, res);
+  wall = mix(uBrickC * clamp(soot, 0.15, 1.6) * (0.7 + 0.7 * fract(vFace.x * 5.0)), wall, 0.30 + 0.70 * res);
+
+  vec3 col = wall * (skyBounce(n) + neonGlow(p, n) * 0.85) + emis;
+  gl_FragColor = vec4(murk(col, p), 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+const TAIL = /* glsl */`
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+// ---- materials.js ----
+
+// Material factories built by string-surgery on the shared bases. Reach for these
+// before writing a raw ShaderMaterial: they already answer uEmi*/uWetness/uMurkD,
+// so a mesh stands IN the street rather than beside it.
+
+const tarmacMat = (ctx, opts = {}) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, { uAggr: F(opts.aggr ?? 1), uSway: F(0) }),
+  vertexShader: VERT_WORLD, fragmentShader: FRAG_TARMAC, side: opts.side ?? THREE.FrontSide,
+});
+
+// aFace rides the frontage instances: (seed, lit fraction, storey offset).
+const VERT_FACE = VERT_WORLD
+  .replace('varying vec3 vP, vN;', 'varying vec3 vP, vN, vFace; attribute vec3 aFace;')
+  .replace('vP = wp.xyz;', 'vP = wp.xyz; vFace = aFace;');
+
+// uPane 0 turns the window grid off, which is what street furniture and car bodies
+// want: the same soot-dark masonry shading with nothing lit in it.
+const brickMat = (ctx, brick, opts = {}) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, {
+    uBrickC: { value: new THREE.Color(...brick) }, uPane: F(opts.pane ?? 1), uSway: F(0),
+  }),
+  vertexShader: VERT_FACE, fragmentShader: FRAG_BRICK, side: opts.side ?? THREE.FrontSide,
+});
+
+// Foliage: tarmac shading with the surface swapped for leaf matter, plus a
+// silhouette carved out of the quad. aTuft = colour, aSprig = (seed, kind, ragged)
+// where kind 0 is a weed in a crack and kind 1 a street-tree canopy cluster.
+const VERT_SPRIG = VERT_WORLD
+  .replace('varying vec3 vP, vN;', 'varying vec3 vP, vN, vTuft, vSprig; varying vec2 vUv; attribute vec3 aTuft, aSprig;')
+  .replace('vP = wp.xyz;', 'vP = wp.xyz; vTuft = aTuft; vSprig = aSprig; vUv = uv;');
+
+// A quad is a rectangle; a plane tree is not. Carve the silhouette with an alpha
+// discard — a lobed canopy for kind 1, a fan of blades for kind 0 — or the
+// vegetation reads as coloured cardboard propped against the kerb.
+const FRAG_SPRIG = FRAG_TARMAC
+  .replace('varying vec3 vP, vN; uniform float uAggr;',
+           'varying vec3 vP, vN, vTuft, vSprig; varying vec2 vUv; uniform float uAggr;')
+  .replace('void main(){ vec3 p = vP; vec3 g = normalize(vN);', `void main(){ vec3 p = vP; vec3 g = normalize(vN);
+  float rad = abs(vUv.x - 0.5) * 2.0, yy = clamp(vUv.y, 0.0, 1.0);
+  vec2 so = vec2(vSprig.x * 31.0, vSprig.x * 17.0);
+  float prof, erode;
+  if (vSprig.y > 0.5) {                                   /* canopy: a clump of lobes with sky through it */
+    prof = (0.35 + 0.95 * sin(3.1416 * pow(yy, 0.8))) * (0.62 + 0.55 * fbm2(vec2(yy * 4.0, 0.0) + so));
+    erode = 0.5 + 0.9 * fbm2(vec2(vUv.x * 9.0, yy * 11.0) + so * 2.3);
+    if (rad > prof * erode) discard;
+    if (fbm2(vec2(vUv.x * 21.0, yy * 25.0) + so * 5.1) < 0.34 + 0.22 * vSprig.z) discard;
+  } else {                                                /* weed: straight blades splaying from a crack */
+    float blade = abs(fract(vUv.x * 6.0 + 0.4 * fbm2(so)) - 0.5) * 2.0;
+    prof = (1.0 - pow(yy, 1.1)) * (0.7 + 0.5 * fbm2(vec2(yy * 3.0, 0.0) + so));
+    if (rad > prof) discard;
+    if (blade > 0.42 - 0.3 * yy) discard;
+  }`)
+  .replace('vec3 base = uTarC * (0.62 + 0.55 * fbm3(p * 1.9) + 0.26 * noise3(p * 16.0));',
+           'vec3 base = vTuft * (0.66 + 0.5 * noise3(p * 11.0)) * (0.55 + 0.75 * yy);')
+  .replace('vec3 n = normalize(mix(nd, slickN(p, g), wet));', 'vec3 n = gl_FrontFacing ? nd : -nd;')
+  .replace('float pool = puddleMask(p);', 'float pool = 0.0;')
+  .replace('float wet = clamp(pool + 0.34 * uWetness, 0.0, 1.0);', 'float wet = 0.45 * uWetness;')
+  .replace(/  if \(ax > uKerbX\) \{[\s\S]*?\n  \}\n/, '')
+  .replace('base *= 1.0 - 0.30 * uGrime;', 'base *= 1.0 - 0.20 * uGrime;')
+  .replace('vec3 lit = base * (skyBounce(n) + neonGlow(p, n)) + wetSpec(p, n) * mix(0.10, 1.0, wet);',
+           'vec3 lit = base * (skyBounce(n) * 0.8 + neonGlow(p, n)) + wetSpec(p, n) * 0.25 * wet;')
+  .replace('lit += uEmiC[0] * 0.02 * dropRings(p.xz * 1.15) * pool;', '');
+
+const sprigMat = (ctx) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, { uAggr: F(0.25), uSway: F(1) }),
+  vertexShader: VERT_SPRIG, fragmentShader: FRAG_SPRIG, side: THREE.DoubleSide,
+});
+
+// ---- layers/blacktop.js ----
+
+/* ═══ COMPONENT: Blacktop (the ground) ═══
+   The street surface and the walls that stand on it. Every vertex's y comes from
+   streetH(x, z) — the shared field the weeds, the pedestrians and the camera all
+   sample — so the kerb is one kerb and nothing floats or sinks.
+
+   This layer carries the world's signature. The carriageway is not a grey plane:
+   it is a cambered surface with water standing in its low camber, and through
+   wetSpec() it mirrors every sign and lamp in the scene back at the camera. The
+   frontages are the second half of the lighting model — a stacked grid of lit
+   windows above the street. */
+class Blacktop {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+
+    // ── the road, the kerbs and both pavements, as one height-field mesh ──
+    const g = new THREE.PlaneGeometry(32, BLOCK, 190, 320);
+    g.rotateX(-Math.PI / 2);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) pos.setY(i, streetH(pos.getX(i), pos.getZ(i)));
+    pos.needsUpdate = true;
+    g.computeVertexNormals();
+    this.road = new THREE.Mesh(g, tarmacMat(ctx, { aggr: 1.0 }));
+    this.road.frustumCulled = false;
+    ctx.scene.add(this.road);
+
+    // ── the frontages: instanced blocks packed along both pavements ──
+    const blocks = [];
+    for (let side = -1; side <= 1; side += 2) {
+      let z = -BLOCK / 2;
+      while (z < BLOCK / 2) {
+        const w = rr(7, 19), d = rr(7, 13), h = rr(9, 24);
+        blocks.push({ x: side * (FACE_X + d / 2 + rr(0, 0.5)), y: h / 2, z: z + w / 2, w, d, h,
+          seed: rnd(), lit: rr(0.35, 0.95), off: rr(0, 3.1) });
+        z += w + rr(0.2, 0.8);
+      }
+    }
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    this.faces = new THREE.InstancedMesh(geo, brickMat(ctx, [0.115, 0.105, 0.115]), blocks.length);
+    this.faces.frustumCulled = false;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s = new THREE.Vector3();
+    const aFace = new Float32Array(blocks.length * 3);
+    blocks.forEach((b, i) => {
+      p.set(b.x, b.y, b.z); s.set(b.d, b.h, b.w);
+      this.faces.setMatrixAt(i, m.compose(p, q, s));
+      aFace[i * 3] = b.seed; aFace[i * 3 + 1] = b.lit; aFace[i * 3 + 2] = b.off;
+    });
+    this.faces.instanceMatrix.needsUpdate = true;
+    geo.setAttribute('aFace', new THREE.InstancedBufferAttribute(aFace, 3));
+    ctx.scene.add(this.faces);
+  }
+  update() { /* static geometry; every state response lives in the shared uniforms */ }
+}
+
+// ---- layers/overcast.js ----
+
+/* ═══ COMPONENT: Overcast (the sky) ═══
+   The night sky over a city is not black and it is not a star field: it is a low
+   lid of cloud lit FROM BELOW by the streets under it. So the gradient runs the
+   wrong way round — brightest at the rooftops, darkest straight up — and the
+   cloud belly reads as texture in the sodium glow rather than silhouette.
+   Stars only where the thinnest cloud lets one or two through, and only when the
+   state raises uStarI at all. */
+class Overcast {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, fog: false,
+      uniforms: uniformsFor(ctx.U, {}),
+      vertexShader: `varying vec3 vDir;
+        void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        float up = clamp(d.y, 0.0, 1.0);
+        /* lit from beneath: the lid burns where the city hits it and falls off upward */
+        vec3 col = mix(uGlowC * 1.45, uGlowC * 0.16, pow(up, 0.55)) * uGlowI;
+
+        /* cloud belly, dragged along the street by the gust; flattened toward the horizon */
+        vec2 q = d.xz * (2.6 / max(up * 0.85 + 0.22, 0.2));
+        float c = fbm3(vec3(q + uGust * uTime * 0.4, uTime * 0.012));
+        col *= 0.66 + 0.85 * c;
+
+        /* the sodium dome standing directly over the rooftops */
+        col += uGlowC * uLampI * 0.55 * pow(1.0 - up, 7.0) * (0.6 + 0.6 * c);
+        col = mix(col, uNeonC * uGlowI * 0.5, 0.18 * uHaloR * pow(1.0 - up, 4.0));
+
+        /* almost no stars — only where the cloud is thinnest */
+        if (uStarI > 0.001) {
+          vec3 sp = d * 150.0;
+          float tw = noise3(floor(sp) + 0.5);
+          float star = step(0.9975, hash1(floor(sp))) * (0.5 + 0.5 * sin(uTime * 2.2 + tw * 31.4));
+          col += vec3(0.80, 0.88, 1.0) * star * uStarI * smoothstep(0.25, 0.75, d.y) * smoothstep(0.62, 0.34, c);
+        }
+
+        /* rain and fog eat the lid from the horizon up */
+        col = mix(col, uMurkC * (0.9 + 0.7 * uHaloR), clamp(0.35 * uRainAmt + 0.60 * uHaloR, 0.0, 0.95) * pow(1.0 - up, 1.7));
+        gl_FragColor = vec4(col, 1.0);
+      ` + TAIL,
+    });
+    this.mesh = new THREE.Mesh(new THREE.SphereGeometry(400, 40, 28), mat);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+  }
+  update() { this.mesh.position.copy(this.ctx.camera.position); }
+}
+
+// ---- layers/kerbside.js ----
+
+/* ═══ COMPONENT: Kerbside (the vegetation) ═══
+   What actually grows on a street: a thin file of pollarded street trees in their
+   pits, and weeds in the gutter joints and along the wall feet. Sparse and scruffy
+   on purpose — this is not a forest, and a dense canopy here would hide the very
+   lights the world is about.
+
+   One InstancedMesh of crossed quads carries both, with aSprig.y selecting which
+   silhouette FRAG_SPRIG carves; a second carries the trunks. InstancedMesh, not
+   InstancedBufferGeometry: only InstancedMesh makes three.js define USE_INSTANCING,
+   which VERT_WORLD needs to see instanceMatrix at all. */
+class Kerbside {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+
+    const tufts = [];            // crossed-quad instances: canopy clusters + weeds
+    const trunks = [];
+
+    // street trees: one every ~20 m, alternating pavements, set back from the kerb
+    for (let z = -BLOCK / 2 + 8; z < BLOCK / 2 - 8; z += rr(11, 17)) {
+      const side = rnd() < 0.5 ? -1 : 1;
+      const x = side * (KERB_X + 1.6 + rr(-0.3, 0.3));
+      const base = streetH(x, z) - 0.05;
+      const th = rr(3.4, 5.1);
+      trunks.push({ x, y: base, z, h: th, r: rr(0.09, 0.15) });
+      const clumps = 3 + Math.floor(rnd() * 3);
+      for (let c = 0; c < clumps; c++) {
+        const s = rr(2.1, 3.4);
+        tufts.push({
+          x: x + rr(-0.8, 0.8), y: base + th * rr(0.62, 0.95), z: z + rr(-0.8, 0.8),
+          sx: s, sy: s * rr(0.8, 1.15), rot: rr(0, Math.PI),
+          kind: 1, ragged: rr(0, 1), seed: rnd(),
+          col: [0.075 + 0.07 * rnd(), 0.150 + 0.11 * rnd(), 0.070 + 0.06 * rnd()],
+        });
+      }
+    }
+
+    // weeds: the gutter joint and the foot of the frontage, where grit collects
+    for (let i = 0; i < 400; i++) {
+      const side = rnd() < 0.5 ? -1 : 1;
+      const gutter = rnd() < 0.78;
+      const x = side * (gutter ? KERB_X - rr(0.1, 0.55) : rr(FACE_X - 0.9, FACE_X - 0.15));
+      const z = rr(-BLOCK / 2, BLOCK / 2);
+      const s = gutter ? rr(0.24, 0.62) : rr(0.16, 0.38);
+      tufts.push({
+        x, y: streetH(x, z) - 0.03, z, sx: s * rr(0.8, 1.3), sy: s, rot: rr(0, Math.PI),
+        kind: 0, ragged: rr(0, 1), seed: rnd(),
+        col: [0.10 + 0.10 * rnd(), 0.15 + 0.13 * rnd(), 0.06 + 0.05 * rnd()],
+      });
+    }
+
+    const geo = crossedQuads();
+    this.tufts = new THREE.InstancedMesh(geo, sprigMat(ctx), tufts.length);
+    this.tufts.frustumCulled = false;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s3 = new THREE.Vector3();
+    const aTuft = new Float32Array(tufts.length * 3), aSprig = new Float32Array(tufts.length * 3);
+    tufts.forEach((t, i) => {
+      p.set(t.x, t.y, t.z); q.setFromAxisAngle(UP, t.rot); s3.set(t.sx, t.sy, t.sx);
+      this.tufts.setMatrixAt(i, m.compose(p, q, s3));
+      aTuft.set(t.col, i * 3);
+      aSprig[i * 3] = t.seed; aSprig[i * 3 + 1] = t.kind; aSprig[i * 3 + 2] = t.ragged;
+    });
+    this.tufts.instanceMatrix.needsUpdate = true;
+    geo.setAttribute('aTuft', new THREE.InstancedBufferAttribute(aTuft, 3));
+    geo.setAttribute('aSprig', new THREE.InstancedBufferAttribute(aSprig, 3));
+    ctx.scene.add(this.tufts);
+
+    const tg = new THREE.CylinderGeometry(0.62, 1.0, 1, 7, 1, true);
+    tg.translate(0, 0.5, 0);
+    this.trunks = new THREE.InstancedMesh(tg, brickMat(ctx, [0.10, 0.085, 0.07], { pane: 0, side: THREE.DoubleSide }), trunks.length);
+    this.trunks.frustumCulled = false;
+    trunks.forEach((t, i) => {
+      p.set(t.x, t.y, t.z); q.identity(); s3.set(t.r, t.h, t.r);
+      this.trunks.setMatrixAt(i, m.compose(p, q, s3));
+    });
+    this.trunks.instanceMatrix.needsUpdate = true;
+    ctx.scene.add(this.trunks);
+  }
+  update() { /* sway is driven by uGust/uTime inside VERT_SPRIG */ }
+}
+
+/* two quads crossed at right angles, built explicitly so there is no dependency on
+   BufferGeometryUtils being present in the assembled bundle. */
+function crossedQuads() {
+  const g = new THREE.BufferGeometry();
+  const pos = [], nor = [], uv = [], idx = [];
+  [{ ax: 1, az: 0, nx: 0, nz: 1 }, { ax: 0, az: 1, nx: 1, nz: 0 }].forEach((b, k) => {
+    const o = k * 4;
+    pos.push(-0.5 * b.ax, 0, -0.5 * b.az, 0.5 * b.ax, 0, 0.5 * b.az,
+             0.5 * b.ax, 1, 0.5 * b.az, -0.5 * b.ax, 1, -0.5 * b.az);
+    for (let i = 0; i < 4; i++) nor.push(b.nx, 0.4, b.nz);
+    uv.push(0, 0, 1, 0, 1, 1, 0, 1);
+    idx.push(o, o + 1, o + 2, o, o + 2, o + 3);
+  });
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return g;
+}
+
+// ---- layers/passersby.js ----
+
+/* ═══ COMPONENT: Passersby (the fauna) ═══
+   People on the pavement, and pigeons working the gutter. They are camera-facing
+   quads — but a quad is a rectangle and a person is not, so the figure is carved
+   out of it in the fragment shader with a signed-distance skeleton: head, torso,
+   two legs that scissor on the walk phase, two arms that swing against them, and
+   an umbrella on whoever thought to bring one. Untextured quads here read as
+   cardboard; the discard is what makes them read as living figures.
+
+   They are nearly black. All the shape they have comes from the neon and sodium
+   catching a wet shoulder — which is the argument this whole world is making. */
+class Passersby {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+    const N = 34;
+
+    this.folk = [];
+    for (let i = 0; i < N; i++) {
+      const pigeon = rnd() < 0.24;
+      const side = rnd() < 0.5 ? -1 : 1;
+      const dir = rnd() < 0.5 ? -1 : 1;
+      // pigeons work the gutter; people keep to the pavement the field defines
+      let x = pigeon ? side * rr(KERB_X - 0.8, KERB_X + 1.4) : side * rr(KERB_X + 1.0, FACE_X - 0.9);
+      while (!pigeon && !onWalk(x, 0)) x = side * rr(KERB_X + 1.0, FACE_X - 0.9);
+      this.folk.push({
+        x, z: rr(-BLOCK / 2, BLOCK / 2), dir,
+        h: pigeon ? rr(0.85, 1.05) : rr(1.58, 1.88),
+        spd: pigeon ? rr(0.15, 0.5) : rr(0.9, 1.6) * dir,
+        kind: pigeon ? 2 : (rnd() < 0.45 ? 1 : 0),
+        seed: rnd(),
+        coat: pigeon
+          ? [0.10, 0.105, 0.12]
+          : [0.035 + 0.05 * rnd(), 0.032 + 0.04 * rnd(), 0.040 + 0.055 * rnd()],
+      });
+    }
+
+    const geo = figureQuad();
+    this.mesh = new THREE.InstancedMesh(geo, figureMat(ctx), N);
+    this.mesh.frustumCulled = false;
+    const aFig = new Float32Array(N * 3), aCoat = new Float32Array(N * 3);
+    this.folk.forEach((f, i) => {
+      aFig[i * 3] = f.seed; aFig[i * 3 + 1] = Math.abs(f.spd); aFig[i * 3 + 2] = f.kind;
+      aCoat.set(f.coat, i * 3);
+    });
+    geo.setAttribute('aFig', new THREE.InstancedBufferAttribute(aFig, 3));
+    geo.setAttribute('aCoat', new THREE.InstancedBufferAttribute(aCoat, 3));
+    ctx.scene.add(this.mesh);
+
+    this.m = new THREE.Matrix4(); this.q = new THREE.Quaternion();
+    this.p = new THREE.Vector3(); this.s = new THREE.Vector3();
+    this.up = new THREE.Vector3(0, 1, 0);
+  }
+
+  update(dt, t) {
+    const { m, q, p, s, up } = this;
+    const cam = this.ctx.camera.position;
+    for (let i = 0; i < this.folk.length; i++) {
+      const f = this.folk[i];
+      f.z += f.spd * dt * (f.kind === 2 ? 0.35 : 1);
+      if (f.z > BLOCK / 2) f.z -= BLOCK; else if (f.z < -BLOCK / 2) f.z += BLOCK;
+      // pigeons potter sideways; people hold their line on the pavement
+      const x = f.kind === 2 ? f.x + 0.35 * Math.sin(t * 0.6 + f.seed * 6.28) : f.x;
+      p.set(x, streetH(x, f.z) - 0.02, f.z);
+      // billboard: yaw only, so the figure stays upright on its feet
+      q.setFromAxisAngle(up, Math.atan2(cam.x - x, cam.z - f.z));
+      s.set(f.h, f.h, f.h);
+      this.mesh.setMatrixAt(i, m.compose(p, q, s));
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+/* a quad 0.9 wide and 1.4 tall in units of body height: the extra headroom is for
+   the umbrella, and the aspect is kept so the SDF below is in real proportions. */
+function figureQuad() {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(
+    [-0.45, 0, 0, 0.45, 0, 0, 0.45, 1.4, 0, -0.45, 1.4, 0], 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1], 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+  g.setIndex([0, 1, 2, 0, 2, 3]);
+  return g;
+}
+
+const VERT_FIG = VERT_WORLD
+  .replace('varying vec3 vP, vN;', 'varying vec3 vP, vN, vFig, vCoat; varying vec2 vUv; attribute vec3 aFig, aCoat;')
+  .replace('vP = wp.xyz;', 'vP = wp.xyz; vFig = aFig; vCoat = aCoat; vUv = uv;');
+
+const figureMat = (ctx) => new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: uniformsFor(ctx.U, { uSway: F(0) }),
+  vertexShader: VERT_FIG,
+  fragmentShader: G + /* glsl */`
+  varying vec3 vP, vN, vFig, vCoat; varying vec2 vUv;
+  float limb(vec2 p, vec2 a, vec2 b){ vec2 pa = p - a, ba = b - a;
+    return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+  void main(){
+    vec2 q = vec2((vUv.x - 0.5) * 0.9, vUv.y * 1.4);
+    float ph = uTime * vFig.y * 3.4 + vFig.x * 6.283;
+    float d = 1e3;
+    if (vFig.z > 1.5) {                                    /* pigeon */
+      float bob = 0.035 * sin(ph * 2.6);                   /* head-bob of a walking pigeon */
+      d = min(d, length((q - vec2(0.0, 0.21 + bob * 0.3)) * vec2(1.0, 1.45)) - 0.155);
+      d = min(d, length(q - vec2(0.13, 0.32 + bob)) - 0.058);
+      d = min(d, limb(q, vec2(0.05, 0.30 + bob), vec2(0.13, 0.32 + bob)) - 0.035);
+      d = min(d, limb(q, vec2(-0.12, 0.21), vec2(-0.31, 0.15)) - 0.032);
+      d = min(d, limb(q, vec2(0.0, 0.06), vec2(0.02, 0.15)) - 0.013);
+    } else {                                               /* a person, mid-stride */
+      float sw = sin(ph), sc = cos(ph);
+      vec2 hip = vec2(0.0, 0.47), sho = vec2(0.0, 0.80);
+      d = min(d, limb(q, hip, hip + vec2(0.19 * sw, -0.47)) - 0.055);
+      d = min(d, limb(q, hip, hip - vec2(0.19 * sw, 0.47)) - 0.055);
+      d = min(d, limb(q, hip, sho) - 0.105 - 0.03 * sin(vFig.x * 9.0));
+      d = min(d, limb(q, sho, sho + vec2(0.15 * sc, -0.30)) - 0.042);
+      d = min(d, limb(q, sho, sho - vec2(0.15 * sc, 0.30)) - 0.042);
+      d = min(d, length(q - vec2(0.0, 0.93)) - 0.087);
+      if (vFig.z > 0.5) {                                  /* umbrella */
+        float r = length(q - vec2(0.08, 1.02));
+        d = min(d, max(abs(r - 0.33) - 0.022, 1.02 - q.y));
+        d = min(d, limb(q, vec2(0.08, 1.02), vec2(0.08, 0.78)) - 0.013);
+      }
+    }
+    if (d > 0.0) discard;
+
+    /* fake a rounded body normal across the quad so a sign can rim one side */
+    vec3 f = normalize(vN);
+    vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), f));
+    vec3 n = normalize(f * 0.85 + right * (vUv.x - 0.5) * 2.4);
+    vec3 lamps = neonGlow(vP, n);
+    float rim = pow(abs(vUv.x - 0.5) * 2.0, 3.0);
+    vec3 col = vCoat * (skyBounce(n) * 0.55 + lamps) + lamps * rim * (0.5 + 1.1 * uWetness);
+    gl_FragColor = vec4(murk(col, vP), 1.0);
+  ` + TAIL,
+});
+
+// ---- layers/downpour.js ----
+
+/* ═══ COMPONENT: Downpour (the effects layer) ═══
+   Rain, and the glow the rain puts around everything that is lit. This layer owns
+   every artificial source in the world: the fixtures themselves (sodium lamps on
+   their brackets, vertical neon, lit shopfronts, a car's headlights), the halo each
+   one wears in the wet air, and the shower falling through them.
+
+   It also PUBLISHES the emitter array. There are more fixtures in the street than
+   the NLAMP slots the shaders read, so every frame this layer chooses the nearest
+   ones and writes uEmiP/uEmiC/uEmiI. That array is what stands in for a sun here:
+   the road, the frontages, the trees and the people all shade against it. */
+class Downpour {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr } = ctx;
+    const box = new THREE.BoxGeometry(1, 1, 1);
+
+    // ── the dark half of the fixtures: columns and brackets ──
+    const posts = [];
+    for (const f of FIXTURES) {
+      if (f.kind !== 0) continue;
+      posts.push({ x: f.postX, y: 3.2, z: f.z, s: [0.16, 6.4, 0.16] });
+      posts.push({ x: (f.postX + f.x) / 2, y: 6.34, z: f.z, s: [Math.abs(f.postX - f.x) + 0.2, 0.13, 0.13] });
+    }
+    this.posts = new THREE.InstancedMesh(box, brickMat(ctx, [0.055, 0.052, 0.058], { pane: 0 }), posts.length);
+    this.posts.frustumCulled = false;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s3 = new THREE.Vector3();
+    posts.forEach((b, i) => { p.set(b.x, b.y, b.z); s3.set(...b.s); this.posts.setMatrixAt(i, m.compose(p, q, s3)); });
+    this.posts.instanceMatrix.needsUpdate = true;
+    ctx.scene.add(this.posts);
+
+    // ── the bright half: the lit bodies themselves ──
+    const lbox = new THREE.BoxGeometry(1, 1, 1);
+    this.lamps = new THREE.InstancedMesh(lbox, lampMat(ctx), FIXTURES.length);
+    this.lamps.frustumCulled = false;
+    const aLit = new Float32Array(FIXTURES.length * 3);
+    FIXTURES.forEach((f, i) => {
+      p.set(f.x, f.y, f.z); s3.set(f.sx, f.sy, f.sz);
+      this.lamps.setMatrixAt(i, m.compose(p, q, s3));
+      aLit[i * 3] = f.c[0] * f.i; aLit[i * 3 + 1] = f.c[1] * f.i; aLit[i * 3 + 2] = f.c[2] * f.i;
+    });
+    this.lamps.instanceMatrix.needsUpdate = true;
+    lbox.setAttribute('aLit', new THREE.InstancedBufferAttribute(aLit, 3));
+    ctx.scene.add(this.lamps);
+
+    // ── one car working the far lane, for a pair of moving headlights ──
+    this.car = new THREE.Group();
+    const dark = brickMat(ctx, [0.045, 0.048, 0.055], { pane: 0 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.86, 0.78, 4.4), dark); body.position.y = 0.62;
+    const cab = new THREE.Mesh(new THREE.BoxGeometry(1.62, 0.66, 2.1), dark); cab.position.set(0, 1.28, -0.25);
+    this.car.add(body, cab);
+    this.car.position.set(KERB_X * 0.5, 0, -75);
+    ctx.scene.add(this.car);
+
+    // ── the halo each source wears: one billboard per emitter slot ──
+    const hg = new THREE.PlaneGeometry(1, 1);
+    this.halos = new THREE.InstancedMesh(hg, haloMat(ctx), NLAMP);
+    this.halos.frustumCulled = false;
+    this.aHalo = new Float32Array(NLAMP * 3);
+    hg.setAttribute('aHalo', new THREE.InstancedBufferAttribute(this.aHalo, 3));
+    ctx.scene.add(this.halos);
+
+    // ── the shower: short streaks in a box that travels with the camera ──
+    const RN = 3600;
+    const rp = new Float32Array(RN * 6), rs = new Float32Array(RN * 2), re = new Float32Array(RN * 2);
+    for (let i = 0; i < RN; i++) {
+      const x = rr(-20, 20), y = rr(-15, 15), z = rr(-23, 23), sd = rr(0, 1);
+      for (let k = 0; k < 2; k++) {
+        rp[i * 6 + k * 3] = x; rp[i * 6 + k * 3 + 1] = y; rp[i * 6 + k * 3 + 2] = z;
+        rs[i * 2 + k] = sd; re[i * 2 + k] = k;
+      }
+    }
+    const rg = new THREE.BufferGeometry();
+    rg.setAttribute('position', new THREE.BufferAttribute(rp, 3));
+    rg.setAttribute('aSeed', new THREE.BufferAttribute(rs, 1));
+    rg.setAttribute('aEnd', new THREE.BufferAttribute(re, 1));
+    this.rain = new THREE.LineSegments(rg, rainMat(ctx));
+    this.rain.frustumCulled = false;
+    ctx.scene.add(this.rain);
+
+    this.m = m; this.q = q; this.p = p; this.s3 = s3;
+    this.order = FIXTURES.map((_, i) => i);
+  }
+
+  update(dt, t) {
+    const { U, cur, camera } = this.ctx;
+    const { m, q, p, s3 } = this;
+
+    // the car closes with the walk, then wraps back to the far end of the block
+    let cz = this.car.position.z + dt * 8.5;
+    if (cz > BLOCK / 2) cz -= BLOCK;
+    this.car.position.z = cz;
+
+    // choose the NLAMP-2 nearest fixtures; the last two slots are the headlights
+    const cp = camera.position;
+    this.order.sort((a, b) => d2(FIXTURES[a], cp) - d2(FIXTURES[b], cp));
+    const NS = NLAMP - 2;
+    for (let k = 0; k < NS; k++) {
+      const f = FIXTURES[this.order[k]];
+      const gain = f.kind === 0 ? cur.lampI : cur.signI;
+      // sodium hums, neon buzzes, and one tube in six is on its way out
+      const ph = f.z * 0.7 + f.side;
+      const buzz = 1 + 0.05 * Math.sin(t * 31 + ph)
+        + (Math.abs(Math.sin(ph * 43.7)) > 0.87 ? 0.5 * Math.sin(t * 7.3 + ph) : 0);
+      U.uEmiP.value[k].set(f.x, f.y, f.z);
+      U.uEmiC.value[k].setRGB(f.c[0], f.c[1], f.c[2]);
+      U.uEmiI.value[k] = (f.kind === 0 ? 26 : 24) * f.i * gain * buzz;
+    }
+    for (let k = 0; k < 2; k++) {
+      U.uEmiP.value[NS + k].set(this.car.position.x + (k ? 0.68 : -0.68), 0.72, cz + 2.15);
+      U.uEmiC.value[NS + k].setRGB(1.0, 0.95, 0.86);
+      U.uEmiI.value[NS + k] = 20 * cur.carI;
+    }
+
+    // halos ride the emitters, nudged toward the camera so they clear their fixture
+    for (let k = 0; k < NLAMP; k++) {
+      const e = U.uEmiP.value[k], I = U.uEmiI.value[k], c = U.uEmiC.value[k];
+      p.copy(e).lerp(cp, 0.03);
+      const r = Math.min(11.0, (1.2 + 3.6 * cur.halo) * (0.8 + 0.085 * I));
+      s3.set(r, r, r);
+      this.halos.setMatrixAt(k, m.compose(p, camera.quaternion, s3));
+      const a = Math.min(I, 38) * 0.016;
+      this.aHalo[k * 3] = c.r * a; this.aHalo[k * 3 + 1] = c.g * a; this.aHalo[k * 3 + 2] = c.b * a;
+    }
+    this.halos.instanceMatrix.needsUpdate = true;
+    this.halos.geometry.attributes.aHalo.needsUpdate = true;
+  }
+}
+
+const d2 = (f, c) => (f.x - c.x) ** 2 + (f.y - c.y) ** 2 + (f.z - c.z) ** 2;
+
+/* the lit body of a fixture: flat emissive, so it reads as the source and not as a
+   surface that happens to be bright. */
+const lampMat = (ctx) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, {}),
+  vertexShader: /* glsl */`
+    varying vec3 vP, vLit; attribute vec3 aLit;
+    void main(){ mat4 mm = modelMatrix * instanceMatrix; vec4 wp = mm * vec4(position, 1.0);
+      vP = wp.xyz; vLit = aLit; gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: G + /* glsl */`
+    varying vec3 vP, vLit;
+    void main(){
+      float gain = 0.5 * (uLampI + uSignI);
+      /* break the slab into tubes and panes so a sign reads as lettering, not a brick of light */
+      float tube = mix(0.30, 1.0, step(0.20, fract(vP.y * 2.6)));
+      float pane = mix(0.55, 1.0, step(0.14, fract(vP.z * 1.7)));
+      vec3 col = vLit * (0.85 + 0.75 * gain) * tube * pane;
+      gl_FragColor = vec4(mix(col, uMurkC * 1.2, 1.0 - murkAtt(vP)), 1.0);
+    ` + TAIL,
+});
+
+/* the halo: the reason a foggy street reads as foggy. A tight core, a broad
+   inverse-square bloom that uHaloR opens right up, and a faint pair of spikes
+   where the wet air smears the source across the eye. */
+const haloMat = (ctx) => new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: uniformsFor(ctx.U, {}),
+  vertexShader: /* glsl */`
+    varying vec2 vH; varying vec3 vHC, vHP; attribute vec3 aHalo;
+    void main(){ mat4 mm = modelMatrix * instanceMatrix; vec4 wp = mm * vec4(position, 1.0);
+      vH = uv; vHC = aHalo; vHP = wp.xyz; gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: G + /* glsl */`
+    varying vec2 vH; varying vec3 vHC, vHP;
+    void main(){
+      vec2 d = vH - 0.5; float r = length(d) * 2.0;
+      if (r > 1.0) discard;
+      float core = exp(-r * r * 26.0);
+      /* the exponent must stay well above zero or a wide halo flattens into a disc
+         with a visible rim — the give-away that it is a billboard and not glare */
+      float bloomR = exp(-r * r * max(2.8, 5.5 - 2.2 * uHaloR));
+      float spike = pow(max(0.0, 1.0 - abs(d.x) * 13.0), 3.0) + pow(max(0.0, 1.0 - abs(d.y) * 13.0), 3.0);
+      float a = (core * 1.3 + bloomR * (0.22 + 0.55 * uHaloR) + spike * 0.10 * bloomR)
+              * (1.0 - smoothstep(0.35, 1.0, r));
+      gl_FragColor = vec4(vHC * a * (0.5 + 0.9 * murkAtt(vHP)), 1.0);
+    ` + TAIL,
+});
+
+/* the shower itself: 1-px streaks, leaning on the gust, brightest where they fall
+   through a light. Additive, so rain brightens the air instead of masking it. */
+const rainMat = (ctx) => new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  uniforms: uniformsFor(ctx.U, {}),
+  vertexShader: G + /* glsl */`
+    attribute float aSeed, aEnd; varying vec3 vC; varying vec3 vQ;
+    void main(){
+      vec3 qq = position;
+      vec2 g = gustAt(qq) * 2.2;   /* the shower leans wherever the street is funnelling the wind */
+      qq.y -= mod(uTime * (13.0 + 11.0 * aSeed) + aSeed * 57.0, 30.0);
+      qq.x += g.x * uTime * 0.9; qq.z += g.y * uTime * 0.9;
+      vec3 hb = vec3(20.0, 15.0, 23.0);
+      vec3 c = cameraPosition + vec3(0.0, 6.0, -6.0);
+      qq = c + mod(qq - c + hb, hb * 2.0) - hb;
+      float len = (0.14 + 0.42 * uRainAmt) * (0.5 + 0.9 * aSeed);
+      qq += aEnd * vec3(g.x * 0.14, 1.0, g.y * 0.14) * len;
+      vQ = qq;
+      vec3 toCam = normalize(cameraPosition - qq);
+      vC = (uMurkC * 0.75 + neonGlow(qq, toCam) * 0.035) * uRainAmt
+           * smoothstep(0.6, 5.0, distance(cameraPosition, qq));
+      gl_Position = projectionMatrix * viewMatrix * vec4(qq, 1.0); }`,
+  fragmentShader: G + /* glsl */`
+    varying vec3 vC; varying vec3 vQ;
+    void main(){ gl_FragColor = vec4(vC * murkAtt(vQ), 1.0);
+    ` + TAIL,
+});
+
+// ---- camera.js ----
+
+/* ═══ COMPONENT: Camera ═══
+   A walk down the carriageway, not the pavement: from the crown of the road both
+   frontages stand on either side and — the point of this world — the wet surface
+   in front of you carries the reflection of every sign above it. The rig therefore
+   holds eye height, aims 18 m down the street and tips slightly DOWN, so the lower
+   half of every frame is reflective road. Aim it at the sky and this scene stops
+   being about its own lighting. Wraps at the ends of the block. */
+class CameraRig {
+  constructor(ctx) { this.ctx = ctx; this.look = new THREE.Vector3(); }
+  update(dt, t) {
+    const { camera } = this.ctx;
+    const z = ((-t * 2.6 + BLOCK * 1.5) % BLOCK) - BLOCK / 2;   // walking toward -z
+    const x = -2.3 + 0.7 * Math.sin(t * 0.19);
+    camera.position.set(x, streetH(x, z) + 1.64 + 0.035 * Math.sin(t * 2.4), z);
+
+    const zf = z - 18;
+    this.look.set(
+      x * 0.4 + 1.1 * Math.sin(t * 0.13),
+      streetH(0, zf) + 1.30 + 0.45 * Math.sin(t * 0.08),
+      zf,
+    );
+    camera.lookAt(this.look);
+    camera.rotation.z = 0.013 * Math.sin(t * 0.17);
+  }
+}
+
+// ---- postfx.js ----
+
+/* ═══ COMPONENT: PostFX ═══
+   Bloom + hand-written ACES pass (gamma + vignette); plain fallback if the
+   composer is unavailable. Contract boilerplate (SCENE_CONTRACT §11). */
+class PostFX {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { renderer, scene, camera } = ctx;
+    try {
+      this.composer = new EffectComposer(renderer); this.composer.addPass(new RenderPass(scene, camera));
+      this.bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.4, 0.45, 0.92); this.composer.addPass(this.bloom);
+      this.out = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uExposure: F(1) }, vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform sampler2D tDiffuse; uniform float uExposure; varying vec2 vUv;
+        vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+        void main(){ vec3 c = texture2D(tDiffuse, vUv).rgb * uExposure; c = aces(c); float v = 1.0 - 0.28 * pow(length(vUv - 0.5) * 1.35, 2.5);
+          gl_FragColor = vec4(pow(c * v, vec3(1.0 / 2.2)), 1.0); }` });
+      this.composer.addPass(this.out); renderer.toneMapping = THREE.NoToneMapping;
+    } catch (e) { console.warn('post-processing unavailable, plain render', e); this.composer = null; }
+  }
+  resize(w, h) { if (this.composer) { this.composer.setSize(w, h); this.bloom.setSize(w, h); } }
+  render() {
+    const { renderer, scene, camera, cur } = this.ctx;
+    if (this.composer) { this.bloom.strength = cur.bloom; this.out.uniforms.uExposure.value = cur.exposure; this.composer.render(); }
+    else { renderer.toneMappingExposure = cur.exposure; renderer.render(scene, camera); }
+  }
+}
+
+// ---- scene.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE: Citynight — a rain-wet street after dark.
+   There is no sun in this world and no key light. Everything you can see is lit
+   by something standing in the street with it: sodium on brackets, neon bolted to
+   a frontage, a lit shopfront, a window four storeys up, a pair of headlights.
+   The road is the second half of the lighting model — wet, it mirrors all of them
+   back at you, and the four named states move that model rather than the palette:
+   how much water is on the ground, how hard it is raining, how far the halo around
+   each source opens, and how many of the sources are switched on at all.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const STATES = {
+  'dry-dusk': {
+    caption: 'The last of the daylight is still in the cloud, the tarmac is dry, and the signs are only just starting to win.',
+    murkC: [0.13, 0.15, 0.21], murkD: 0.0070, glowC: [0.21, 0.25, 0.36], glowI: 0.95,
+    neonC: [0.9, 0.6, 0.7], neonI: 0.85, lampI: 0.55, signI: 0.60, carI: 0.7,
+    winC: [1.0, 0.82, 0.55], winI: 0.85, winOcc: 0.30,
+    tarC: [0.105, 0.105, 0.118], grime: 0.55,
+    wet: 0.10, ripple: 0.15, rain: 0.0, halo: 0.20, star: 0.0,
+    gustX: 0.10, gustZ: 0.05, bloom: 0.26, exposure: 0.92 },
+  'neon-rain': {
+    caption: 'Hard rain. Every sign in the street is standing upside down in the road, and the road will not hold still.',
+    murkC: [0.085, 0.065, 0.105], murkD: 0.0125, glowC: [0.16, 0.13, 0.22], glowI: 0.62,
+    neonC: [1.0, 0.25, 0.55], neonI: 1.25, lampI: 0.80, signI: 1.75, carI: 1.10,
+    winC: [1.0, 0.80, 0.52], winI: 1.00, winOcc: 0.46,
+    tarC: [0.060, 0.060, 0.074], grime: 0.35,
+    wet: 1.00, ripple: 1.00, rain: 1.00, halo: 0.75, star: 0.0,
+    gustX: 0.55, gustZ: 0.30, bloom: 0.46, exposure: 0.90 },
+  'after-midnight': {
+    caption: 'The shops are shut and the flats are dark. Only the sodium is left, and the street has gone to a black mirror under it.',
+    murkC: [0.045, 0.048, 0.072], murkD: 0.0085, glowC: [0.085, 0.100, 0.170], glowI: 0.62,
+    neonC: [0.55, 0.65, 1.0], neonI: 1.05, lampI: 1.35, signI: 0.35, carI: 0.9,
+    winC: [1.0, 0.76, 0.45], winI: 0.85, winOcc: 0.07,
+    tarC: [0.055, 0.055, 0.068], grime: 0.45,
+    wet: 0.85, ripple: 0.35, rain: 0.15, halo: 0.35, star: 0.35,
+    gustX: 0.12, gustZ: 0.06, bloom: 0.40, exposure: 0.95 },
+  'fog-halo': {
+    caption: 'Fog off the river. Nothing has an edge any more — every light in the street is just the middle of its own halo.',
+    murkC: [0.22, 0.175, 0.145], murkD: 0.0290, glowC: [0.26, 0.21, 0.165], glowI: 0.70,
+    neonC: [1.0, 0.70, 0.35], neonI: 1.15, lampI: 1.45, signI: 1.05, carI: 1.0,
+    winC: [1.0, 0.80, 0.50], winI: 0.90, winOcc: 0.22,
+    tarC: [0.075, 0.073, 0.080], grime: 0.50,
+    wet: 0.70, ripple: 0.30, rain: 0.25, halo: 1.55, star: 0.0,
+    gustX: 0.06, gustZ: 0.03, bloom: 0.62, exposure: 0.95 },
+};
+const ORDER = Object.keys(STATES);
+const isColor = (k) => Array.isArray(STATES[ORDER[0]][k]);
+
+const sceneDef = {
+  meta: { fov: 64, near: 0.08, far: 900, pixelRatio: 1.5, rate: 1.1, seed: 7, toneMapping: 'ACESFilmicToneMapping' },
+
+  buildUniforms() {
+    return {
+      uTime: F(0),
+      // the emitter array: this world's replacement for a sun. Downpour rewrites it
+      // every frame from the fixtures nearest the camera.
+      uEmiP: { value: Array.from({ length: NLAMP }, () => new THREE.Vector3(0, -50, 0)) },
+      uEmiC: { value: Array.from({ length: NLAMP }, () => new THREE.Color(1, 1, 1)) },
+      uEmiI: { value: new Array(NLAMP).fill(0) },
+      uMurkC: C3(), uMurkD: F(0.012),
+      uGlowC: C3(), uGlowI: F(0.6),
+      uNeonC: C3(), uNeonI: F(1), uLampI: F(1), uSignI: F(1),
+      uWinC: C3(), uWinI: F(1), uWinOcc: F(0.3),
+      uTarC: C3(), uGrime: F(0.5),
+      uWetness: F(0.5), uRipple: F(0.5), uRainAmt: F(0.5), uHaloR: F(0.4), uStarI: F(0),
+      uKerbX: F(KERB_X), uFaceX: F(FACE_X),
+      uGust: { value: new THREE.Vector2(0.2, 0.1) },
+    };
+  },
+
+  initialState() { const h = location.hash.slice(1); return STATES[h] ? h : ORDER[0]; },
+
+  resolveState(name) {
+    const s = STATES[STATES[name] ? name : ORDER[0]];
+    const t = {};
+    for (const k in s) { if (k === 'caption') continue; t[k] = isColor(k) ? new THREE.Color(...s[k]) : s[k]; }
+    return t;
+  },
+
+  applyToUniforms(cur, ctx) {
+    const U = ctx.U;
+    U.uMurkC.value.copy(cur.murkC); U.uMurkD.value = cur.murkD;
+    U.uGlowC.value.copy(cur.glowC); U.uGlowI.value = cur.glowI;
+    U.uNeonC.value.copy(cur.neonC); U.uNeonI.value = cur.neonI;
+    U.uLampI.value = cur.lampI; U.uSignI.value = cur.signI;
+    U.uWinC.value.copy(cur.winC); U.uWinI.value = cur.winI; U.uWinOcc.value = cur.winOcc;
+    U.uTarC.value.copy(cur.tarC); U.uGrime.value = cur.grime;
+    U.uWetness.value = cur.wet; U.uRipple.value = cur.ripple; U.uRainAmt.value = cur.rain;
+    U.uHaloR.value = cur.halo; U.uStarI.value = cur.star;
+    U.uGust.value.set(cur.gustX, cur.gustZ);
+  },
+
+  setup(ctx) { ctx.scene.background = ctx.U.uMurkC.value; },
+
+  layers: [Overcast, Blacktop, Kerbside, Passersby, Downpour],
+  camera: CameraRig,
+  postfx: PostFX,
+
+  onHashChange(sm) { const name = STATES[location.hash.slice(1)] ? location.hash.slice(1) : ORDER[0]; sm.setState(name); showState(name); },
+
+  setupUI(ctx, sm) {
+    captionEl = document.getElementById('caption'); nav = document.getElementById('nav');
+    ORDER.forEach((n) => { const b = document.createElement('button'); b.textContent = n; b.dataset.state = n; b.addEventListener('click', () => { location.hash = n; }); nav.appendChild(b); });
+    showState(sceneDef.initialState(), true);
+  },
+};
+
+// ---- caption + nav (module-scoped, wired in setupUI) ----
+let captionEl, nav;
+function showState(name, instant = false) {
+  nav.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.state === name));
+  captionEl.classList.add('fade');
+  setTimeout(() => { captionEl.textContent = STATES[name].caption; captionEl.classList.remove('fade'); }, instant ? 0 : 500);
+}
+
+boot(document.getElementById('scene'), sceneDef);
+
+</script>
+</body>
+</html>

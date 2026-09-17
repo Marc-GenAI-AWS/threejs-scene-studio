@@ -1,0 +1,930 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>High Park — a prairie basin under the peaks</title>
+<meta name="states" content="first-light,cloud-shadows,storm-break,gold-dusk" />
+<style>
+  :root { --ink: #f2efe4; --ink-dim: rgba(242,239,228,.42); --ink-mid: rgba(242,239,228,.74); --hairline: rgba(242,239,228,.16); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #0a0e12; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; color: var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #ui::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 220px; background: linear-gradient(transparent, rgba(8,10,8,.55)); z-index: -1; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 22px 28px; }
+  .mark { font-size: 12px; font-weight: 500; letter-spacing: .34em; text-shadow: 0 1px 8px rgba(0,0,0,.5); }
+  .mark small { letter-spacing: .2em; font-weight: 400; color: var(--ink-dim); margin-left: 1.2em; font-size: 10px; }
+  .hint { font-size: 10px; letter-spacing: .12em; color: var(--ink-dim); }
+  footer { padding: 0 28px 26px; max-width: 720px; }
+  #caption { font-family: Georgia, "Times New Roman", serif; font-style: italic; font-size: 18px; line-height: 1.45; color: var(--ink-mid);
+    text-shadow: 0 1px 10px rgba(0,0,0,.6); min-height: 2.9em; transition: opacity .6s; }
+  #caption.fade { opacity: 0; }
+  nav { display: flex; gap: 8px; margin-top: 16px; pointer-events: auto; flex-wrap: wrap; }
+  nav button { appearance: none; background: transparent; border: 1px solid var(--hairline); color: var(--ink-dim); font: inherit; font-size: 10px;
+    letter-spacing: .2em; text-transform: uppercase; padding: 8px 14px; border-radius: 16px; cursor: pointer; transition: all .4s; backdrop-filter: blur(6px); }
+  nav button:hover { color: var(--ink); border-color: rgba(242,239,228,.4); }
+  nav button.on { color: #14120a; background: rgba(240, 228, 196, .9); border-color: transparent; }
+  @media (max-width: 560px) { #caption { font-size: 15px; } }
+</style>
+<script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="ui">
+  <header><div class="mark">HIGH PARK <small>MOUNTAIN PRAIRIE</small></div><div class="hint">#state in the URL selects a scene</div></header>
+  <footer><div id="caption"></div><nav id="nav"></nav></footer>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ---- ../contract/runtime.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE CONTRACT — shared runtime (v1)
+   The scene-agnostic engine every scene boots against. See SCENE_CONTRACT.md.
+   Provides: uniform helpers, a seeded RNG, a state machine (enumerated OR
+   factored manifest), and the assembler loop. A scene supplies a `sceneDef`
+   (uniforms, layer classes, camera, state resolver, per-frame apply) to boot().
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* uniform helpers — a ShaderMaterial's uniforms is uniformsFor({...locals}) */
+const F  = (v) => ({ value: v });
+const C3 = () => ({ value: new THREE.Color() });
+const V3 = (x = 0, y = 0, z = 0) => ({ value: new THREE.Vector3(x, y, z) });
+const uniformsFor = (U, extra = {}) => ({ ...U, ...extra });
+
+/* deterministic RNG (park–miller); no Math.random in scene code */
+function makeRNG(seed = 7) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  const rr = (a, b) => a + (b - a) * rnd();
+  return { rnd, rr };
+}
+
+/* cur → target exponential interpolation of every visual parameter.
+   `resolve(name)` returns a fresh target object (numbers, THREE.Color, THREE.Vector3).
+   Colors/Vectors lerp via .lerp; numbers lerp arithmetically. */
+class StateMachine {
+  constructor({ initial, resolve, rate = 1.2, onApply }) {
+    this.resolve = resolve; this.rate = rate; this.onApply = onApply;
+    this.cur = {}; this.target = {};
+    this.setState(initial, true);
+  }
+  setState(name, instant = false) {
+    const t = this.resolve(name);
+    for (const k in t) if (!(k in this.cur)) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+    this.target = t;
+    if (instant) for (const k in t) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+  }
+  tick(dt, t, ctx) {
+    const k = 1 - Math.exp(-dt * this.rate), cur = this.cur, tg = this.target;
+    for (const key in tg) {
+      const c = cur[key], target = tg[key];
+      if (typeof c === 'number') cur[key] = c + (target - c) * k;
+      else if (c && c.lerp) c.lerp(target, k);
+    }
+    if (this.onApply) this.onApply(cur, ctx, t);
+  }
+}
+
+/* boot the frozen skeleton: renderer, scene, camera, layers[], main loop.
+   sceneDef: { meta, buildUniforms(), resolveState(name), initialState(),
+               applyToUniforms(cur,ctx,t), layers:[Class], camera:Class,
+               postfx?:Class, setupUI?(ctx,sm), onHashChange?(sm) } */
+function boot(canvas, sceneDef) {
+  const meta = sceneDef.meta || {};
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, meta.pixelRatio ?? 2));
+  renderer.setSize(innerWidth, innerHeight);
+  if (meta.toneMapping && THREE[meta.toneMapping]) renderer.toneMapping = THREE[meta.toneMapping];
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(meta.fov ?? 55, innerWidth / innerHeight, meta.near ?? 0.5, meta.far ?? 10000);
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const { rnd, rr } = makeRNG(meta.seed ?? 7);
+  const U = sceneDef.buildUniforms();
+  const ctx = { THREE, renderer, scene, camera, U, rnd, rr, reducedMotion, cur: null };
+
+  const sm = new StateMachine({
+    initial: sceneDef.initialState(),
+    resolve: (name) => sceneDef.resolveState(name),
+    rate: meta.rate ?? 1.2,
+    onApply: (cur, c, t) => sceneDef.applyToUniforms(cur, c, t),
+  });
+  ctx.cur = sm.cur;
+
+  // scene-level setup (background, renderer tweaks) before layers are built
+  if (sceneDef.setup) sceneDef.setup(ctx);
+
+  const layers = (sceneDef.layers || []).map((L) => new L(ctx));
+  const rig = sceneDef.camera ? new sceneDef.camera(ctx) : null;
+  const post = sceneDef.postfx ? new sceneDef.postfx(ctx) : null;
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); if (post && post.resize) post.resize(innerWidth, innerHeight);
+  });
+  addEventListener('hashchange', () => sceneDef.onHashChange ? sceneDef.onHashChange(sm) : sm.setState(location.hash.slice(1)));
+  if (sceneDef.setupUI) sceneDef.setupUI(ctx, sm);
+
+  const clock = new THREE.Clock(); let t = 0;
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05); t += dt;
+    U.uTime.value = t;
+    sm.tick(dt, t, ctx);
+    if (rig) rig.update(dt, t, ctx);
+    for (const l of layers) if (l.update) l.update(dt, t);
+    if (post) post.render(); else renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+  return { ctx, sm, layers, rig, post };
+}
+
+// ---- field.js ----
+
+// High Park constants + the shared ground field. groundH is the ONE floor
+// function used by the mesh, grass, rocks, horses and camera alike (SCENE_CONTRACT §6).
+
+const SADDLE = new THREE.Vector3(0, 38, -340);   /* the gap the light falls through */
+const BASIN_R = 200;                             /* prairie extent */
+
+const hashJ = (x, y) => { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return s - Math.floor(s); };
+function vnoise2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y); let xf = x - xi, yf = y - yi;
+  xf = xf * xf * (3 - 2 * xf); yf = yf * yf * (3 - 2 * yf);
+  const a = hashJ(xi, yi), b = hashJ(xi + 1, yi), c = hashJ(xi, yi + 1), d = hashJ(xi + 1, yi + 1);
+  return a + (b - a) * xf + (c - a) * yf + (a - b - c + d) * xf * yf;
+}
+const fbmJ = (x, y, o = 4) => { let a = 0.5, s = 0; for (let i = 0; i < o; i++) { s += a * vnoise2(x, y); x = x * 2.03 + 1.3; y = y * 2.01 + 0.7; a *= 0.5; } return s; };
+
+// domain: the basin, roughly |x|<500, -480<z<130 (peaks apron included);
+// range: ≈ -8 in the hollows up to ~+24 at the peak apron rim. Owned by Prairie.
+const groundH = (x, z) => {
+  const roll = fbmJ(x * 0.011, z * 0.011, 4) * 12 - 6 + Math.sin(x * 0.05) * 1.2;
+  const apron = THREE.MathUtils.clamp((-z - 150) / 130, 0, 1); const hollow = -2.5 * Math.exp(-((x - 35) ** 2 + (z + 60) ** 2) / 2400);
+  return roll + apron * apron * 30 + hollow;   /* apron caps at a low rim; Peaks supplies the summits */
+};
+
+// peak ridge profile (also drives the silhouette ranks)
+const ridged = (x, s) => { let a = 0.5, f = 1, sum = 0, w = 1;
+  for (let i = 0; i < 6; i++) { let n = 1 - Math.abs(vnoise2(x * f + s * 13.7, s * 7.1) * 2 - 1); n = n * n * w; w = Math.min(1, n * 1.7); sum += n * a; f *= 2.1; a *= 0.55; } return sum; };
+
+// ---- prelude.glsl.js ----
+
+// High Park GLSL prelude. G = CORE noise/fog + scene FIELDS (windAt, cloudShad,
+// shaftMask) shared by every layer so one state moves the whole basin.
+
+const G = /* glsl */`
+uniform float uTime; uniform vec3 uSkyTop, uSkyHorizon, uSunC; uniform float uSunI; uniform vec3 uSunDir;
+uniform vec3 uFogC; uniform float uFogD, uWind, uCloud, uShadowAmt, uShaft, uFlash; uniform vec3 uShaftDir, uSaddle;
+const vec3 FLASH_C = vec3(0.78, 0.84, 1.0);   /* cold blue-white lightning light */
+float hash1(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float noise3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash1(i), hash1(i+vec3(1,0,0)), f.x), mix(hash1(i+vec3(0,1,0)), hash1(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash1(i+vec3(0,0,1)), hash1(i+vec3(1,0,1)), f.x), mix(hash1(i+vec3(0,1,1)), hash1(i+vec3(1,1,1)), f.x), f.y), f.z); }
+float fbm3(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * noise3(p); p = p * 2.03 + 1.7; a *= 0.5; } return s; }
+float fbm2(vec2 p){ return fbm3(vec3(p, 0.37)); }
+/* wind field: broad gusts + fine ripples travelling east (+x); every swaying thing samples this */
+float windAt(vec2 xz, float t){ return (fbm2(xz * 0.020 - vec2(t * 0.50, t * 0.06)) * 0.75
+  + fbm2(xz * 0.11 - vec2(t * 1.5, 0.0)) * 0.35 + 0.18) * uWind; }
+/* cloud-shadow factor: 1 in sun, dips where cumulus pass; shared by turf, grass, herd, rocks */
+float cloudShad(vec3 p){ return 1.0 - uShadowAmt * 0.6 *
+  smoothstep(0.16, 0.5, fbm2(p.xz * 0.0045 + vec2(uTime * 0.014, uTime * 0.004))); }
+/* the hero: crepuscular corridor falling from the saddle along uShaftDir */
+float shaftMask(vec3 p){
+  vec3 d = p - uSaddle; float h = dot(d, uShaftDir); vec3 q = d - h * uShaftDir;
+  float r = length(q.xz * vec2(1.0, 2.2)) / (18.0 + h * 0.18);                 /* widening elliptical corridor */
+  float blades = 0.55 + 0.45 * fbm2(vec2(q.x * 0.14 + 5.0, uTime * 0.05));     /* it is made of separate blades */
+  return uShaft * smoothstep(1.1, 0.35, r) * smoothstep(-6.0, 30.0, h) * exp(-h * 0.006) * blades; }
+/* valley haze: denser low, tinted by state; every material calls this last */
+vec3 fog(vec3 col, vec3 p){ float d = distance(p, cameraPosition);
+  float alt = clamp((p.y + 6.0) / 130.0, 0.0, 1.0);
+  float f = 1.0 - exp(-uFogD * d * (1.15 - 1.0 * alt));
+  return mix(col, uFogC, clamp(f, 0.0, 0.95)); }
+float fogAtt(vec3 p){ float d = distance(p, cameraPosition); float alt = clamp((p.y + 6.0) / 130.0, 0.0, 1.0);
+  return exp(-uFogD * d * (1.15 - 1.0 * alt)); }
+`;
+
+const TAIL = /* glsl */`
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+const VERT_WORLD = /* glsl */`
+varying vec3 vP, vN;
+void main(){
+  #ifdef USE_INSTANCING
+  mat4 m = modelMatrix * instanceMatrix;
+  #else
+  mat4 m = modelMatrix;
+  #endif
+  vec4 wp = m * vec4(position, 1.0);
+  vP = wp.xyz; vN = normalize(mat3(m) * normal); gl_Position = projectionMatrix * viewMatrix * wp; }`;
+
+/* base lit-matter fragment: albedo mottled by fbm, lit by sun×cloudShad + sky ambient + shaft boost */
+const FRAG_MATTER = G + /* glsl */`
+varying vec3 vP, vN; uniform vec3 uBase; uniform float uMottle;
+void main(){ vec3 p = vP;
+  vec3 n = normalize(normalize(vN) + 0.4 * vec3(noise3(p * 0.8 + 1.0) - 0.5, noise3(p * 0.8 + 2.0) - 0.5, noise3(p * 0.8 + 3.0) - 0.5));
+  float m1 = fbm3(p * 0.35), m2 = noise3(p * 3.0);
+  vec3 base = uBase * (1.0 - uMottle * 0.4 + uMottle * 0.8 * m1) * (0.82 + 0.28 * m2);
+  float lam = max(dot(n, normalize(uSunDir)), 0.0);
+  float sm = shaftMask(p), cs = cloudShad(p);
+  vec3 skyFill = mix(uSkyHorizon, uSkyTop, 0.5) * (0.30 + 0.22 * max(n.y, 0.0));
+  vec3 light = skyFill + uSunC * uSunI * lam * (0.5 + 0.6 * cs) + uSunC * sm * (0.4 + 0.6 * lam) + FLASH_C * uFlash * (0.7 + 0.6 * max(n.y, 0.0));
+  gl_FragColor = vec4(fog(base * light, p), 1.0);` + TAIL;
+
+// ---- materials.js ----
+
+// Base lit-matter material factory (rocks, horses). SCENE_CONTRACT §5.
+const matterMat = (ctx, base, opts = {}) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, { uBase: { value: new THREE.Color(...base) }, uMottle: F(opts.mottle ?? 1) }),
+  vertexShader: VERT_WORLD, fragmentShader: FRAG_MATTER, side: opts.side ?? THREE.FrontSide });
+
+// ---- layers/atmosphere.js ----
+
+/* ═══ COMPONENT: Atmosphere ═══
+   Sky dome: gradient, sun disc through the gap, cumulus field / storm shelf,
+   the break above the saddle, dusk stars, lightning kiss on the cloud bases. */
+class Atmosphere {
+  constructor(ctx) {
+    const { scene, U } = ctx;
+    scene.add(new THREE.Mesh(new THREE.SphereGeometry(1200, 48, 24), new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, uniforms: uniformsFor(U, {}),
+      vertexShader: `varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      uniform float uStars; varying vec3 vD;
+      void main(){ vec3 d = normalize(vD); float h = max(d.y, 0.0);
+        /* base gradient: pull the visible near-horizon band well toward the blue zenith so it
+           reads as a real sky and white clouds have something to contrast against */
+        vec3 col = mix(uSkyHorizon, uSkyTop, 0.18 + 0.72 * smoothstep(0.0, 0.6, h));
+        float s = max(dot(d, normalize(uSunDir)), 0.0);
+        col += uSunC * (pow(s, 900.0) * 4.0 + pow(s, 16.0) * 0.4 + pow(s, 3.0) * 0.08) * uSunI;   /* sun disc + glow */
+        /* cumulus — near-horizontal views foreshorten the sky, so sample at HIGH horizontal
+           frequency (|d.y|+small k, never /d.y) to get separate puffs across the frame */
+        vec2 cuv = d.xz / (abs(d.y) + 0.18);
+        vec2 drift = vec2(uTime * 0.02 * (0.4 + uWind), uTime * 0.008);
+        float cov = fbm2(cuv * 2.2 + drift);              /* fbm here is ~0..0.94; DON'T *0.5+0.5 or coverage saturates */
+        float det = fbm2(cuv * 5.5 + drift * 1.7);
+        float puff = cov * 0.62 + det * 0.38;
+        float band = smoothstep(0.02, 0.14, h) * smoothstep(1.0, 0.45, h);             /* clouds ride a band above the peaks */
+        float cloud = smoothstep(0.5 - uCloud * 0.24, 0.60, puff) * band;             /* partial coverage → distinct puffs */
+        /* shade: shadowed grey-blue underside vs bright sunlit top, so cumulus have real form */
+        float litc = smoothstep(0.3, 0.62, det);
+        vec3 cbase = mix(vec3(0.40, 0.44, 0.52), uFogC * 0.55, 0.35);                   /* cool shadowed base */
+        vec3 ctop = mix(vec3(1.25), uSunC, 0.18 * uSunI);                               /* bright sunlit top */
+        vec3 cloudCol = mix(cbase, ctop, litc) * (0.72 + 0.35 * uSunI) + uSunC * pow(s, 2.0) * 0.4 * uSunI;
+        /* storm shelf: a heavy overcast that darkens the whole sky band, not just the puffs */
+        vec3 stormCol = mix(uSkyTop, uFogC, 0.55) * 0.72;
+        float over = smoothstep(0.55, 0.95, uCloud) * band;
+        col = mix(col, stormCol, over * 0.6);
+        cloudCol = mix(cloudCol, stormCol * 0.85, smoothstep(0.55, 0.95, uCloud));
+        col = mix(col, cloudCol, cloud);
+        /* the break above the saddle: clouds thin and a little sun leaks through */
+        float gap = exp(-pow(length(d.xz - normalize(uSaddle).xz) * 2.6, 2.0));
+        col = mix(col, mix(col, uSunC * (0.6 + uSunI), 0.5), gap * uShaft * 0.4 * (1.0 - h * 0.6));
+        vec2 sp = d.xz / max(d.y, 0.05) * 70.0; vec2 cell = floor(sp);
+        float stv = step(0.95, hash1(vec3(cell, 1.0)));
+        float star = smoothstep(0.09, 0.0, length(fract(sp) - 0.5 - 0.3 * (vec2(hash1(vec3(cell, 2.0)), hash1(vec3(cell, 3.0))) - 0.5))) * stv;
+        col += star * uStars * smoothstep(0.12, 0.5, h) * (1.0 - cloud);
+        col += uFlash * FLASH_C * (0.15 + 0.5 * cloud) * (1.0 - h * 0.4);               /* lightning kisses the cloud bases (kept low so the bolt stays visible) */
+        col = mix(col, uFogC, smoothstep(0.05, 0.0, h) * 0.55);                         /* soft haze right at the horizon line */
+        gl_FragColor = vec4(col, 1.0);` + TAIL })));
+  }
+}
+
+// ---- layers/peaks.js ----
+
+/* ═══ COMPONENT: Peaks ═══
+   Ridged heightfield ring behind the basin with snow-by-altitude (per-vertex,
+   not per-triangle, so nothing speckles) and two silhouette ranks in the haze.
+   Owns its snow/rock colour uniforms (published from cur each frame). */
+class Peaks {
+  constructor(ctx) {
+    const { scene, U } = ctx;
+    this.ctx = ctx;
+    /* near range: a smooth ridged heightfield across the north of the basin.
+       Summits are raised well clear of the haze; snow is computed per-vertex
+       from world altitude (smooth, not per-triangle) so nothing speckles. */
+    const W = 1100, D = 420, SEG_X = 480, SEG_Z = 130;
+    const geo = new THREE.PlaneGeometry(W, D, SEG_X, SEG_Z); geo.rotateX(-Math.PI / 2); geo.translate(0, 0, -480);
+    const pos = geo.attributes.position, aSnow = new Float32Array(pos.count);
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const depth = THREE.MathUtils.clamp((-z - 250) / 240, 0, 1);                     /* 0 basin edge → 1 back */
+      const gap = 1 - 0.72 * Math.exp(-((x - SADDLE.x) ** 2) / (2 * 46 * 46));          /* the saddle notch */
+      const relief = Math.pow(ridged(x * 0.0030, 2.1) * gap, 1.3) + ridged(x * 0.0072, 5.7) * 0.28;
+      const y = groundH(x, z) + depth * depth * (26 + relief * 300);
+      pos.setY(i, y);
+      aSnow[i] = THREE.MathUtils.smoothstep(y, 88, 175);                                /* clean snow line by height */
+    }
+    geo.setAttribute('aSnow', new THREE.BufferAttribute(aSnow, 1));
+    geo.computeVertexNormals();
+    const mat = new THREE.ShaderMaterial({
+      uniforms: uniformsFor(U, { uSnow: C3(), uRock: C3() }),
+      vertexShader: `varying vec3 vP, vN; varying float vSnow; attribute float aSnow;
+      void main(){ vec4 wp = modelMatrix * vec4(position, 1.0); vP = wp.xyz; vN = normalize(mat3(modelMatrix) * normal); vSnow = aSnow;
+        gl_Position = projectionMatrix * viewMatrix * wp; }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vP, vN; varying float vSnow; uniform vec3 uSnow, uRock;
+      void main(){ vec3 p = vP, n = normalize(vN);
+        float slope = 1.0 - n.y;
+        float snow = vSnow * smoothstep(0.72, 0.42, slope);                             /* snow slides off cliffs, softly */
+        float strata = 0.5 + 0.5 * sin(p.y * 0.13 + fbm2(p.xz * 0.02) * 2.5);
+        vec3 rock = uRock * (0.82 + 0.24 * strata);
+        vec3 turf = mix(uRock, vec3(0.20, 0.26, 0.13), 0.7);                            /* grassy apron low down */
+        vec3 base = mix(mix(turf, rock, smoothstep(20.0, 55.0, p.y)), uSnow, snow);
+        float lam = max(dot(n, normalize(uSunDir)), 0.0);
+        vec3 sky = mix(uSkyHorizon, uSkyTop, 0.5);
+        vec3 light = sky * (0.42 + 0.26 * max(n.y, 0.0)) + uSunC * uSunI * lam * (0.55 + 0.45 * cloudShad(p));
+        light += uSunC * uSunI * pow(lam, 2.5) * snow * 0.7;                            /* alpenglow / snow glare */
+        gl_FragColor = vec4(fog(base * light, p), 1.0);` + TAIL });
+    this.mat = mat; scene.add(new THREE.Mesh(geo, mat));
+    /* two soft silhouette ranks fading into the haze behind */
+    for (const [zz, hh, sd, mixA] of [[-820, 210, 3.3, 0.55], [-1080, 260, 8.9, 0.78]]) {
+      const g2 = new THREE.PlaneGeometry(3200, 620, 260, 1);
+      const p2 = g2.attributes.position;
+      for (let i = 0; i < p2.count; i++) { if (p2.getY(i) > 0) p2.setY(i, ridged(p2.getX(i) * 0.0026, sd) * hh - hh * 0.15); else p2.setY(i, -240); }
+      g2.computeVertexNormals();
+      const m2 = new THREE.Mesh(g2, new THREE.ShaderMaterial({
+        uniforms: uniformsFor(U, { uSnow: mat.uniforms.uSnow, uRock: mat.uniforms.uRock, uMixA: F(mixA) }),
+        vertexShader: `varying vec3 vP; void main(){ vec4 wp = modelMatrix * vec4(position, 1.0); vP = wp.xyz; gl_Position = projectionMatrix * viewMatrix * wp; }`,
+        fragmentShader: G + `
+        varying vec3 vP; uniform vec3 uSnow, uRock; uniform float uMixA;
+        void main(){ float snow = smoothstep(0.42, 0.66, clamp(vP.y / 200.0, 0.0, 1.0));
+          vec3 col = mix(uRock, uSnow, snow) * (0.5 + 0.5 * uSunI);
+          gl_FragColor = vec4(mix(col, uFogC, uMixA), 1.0);` + TAIL }));
+      m2.position.z = zz; m2.renderOrder = -1; scene.add(m2);
+    }
+  }
+  update() { const cur = this.ctx.cur; this.mat.uniforms.uSnow.value.copy(cur.peakSnow); this.mat.uniforms.uRock.value.copy(cur.peakRock); }
+}
+
+// ---- layers/prairie.js ----
+
+/* ═══ COMPONENT: Prairie (ground) ═══
+   Rolling turf heightfield built from the shared groundH; soil patches, cloud
+   shadows and the shaft corridor read on the ground. */
+class Prairie {
+  constructor(ctx) {
+    const { scene, U } = ctx;
+    const geo = new THREE.PlaneGeometry(1000, 780, 190, 150); geo.rotateX(-Math.PI / 2); geo.translate(0, 0, -160);
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) pos.setY(i, groundH(pos.getX(i), pos.getZ(i)));
+    geo.computeVertexNormals();
+    scene.add(new THREE.Mesh(geo, new THREE.ShaderMaterial({
+      uniforms: uniformsFor(U, {}), vertexShader: VERT_WORLD, fragmentShader: G + /* glsl */`
+      varying vec3 vP, vN; uniform vec3 uGrassA, uGrassB;
+      void main(){ vec3 p = vP, n = normalize(vN);
+        float turf = fbm2(p.xz * 0.05) * 0.5 + 0.5, soil = smoothstep(0.72, 0.85, fbm2(p.xz * 0.03 + 9.0));
+        vec3 base = mix(uGrassA * 1.1, uGrassB * 0.55, turf); base = mix(base, vec3(0.30, 0.24, 0.16), soil * 0.6);
+        base *= 0.92 + 0.16 * noise3(p * 2.0);
+        float lam = max(dot(n, normalize(uSunDir)), 0.0);
+        vec3 light = mix(uSkyHorizon, uSkyTop, 0.5) * (0.30 + 0.2 * n.y)
+                   + uSunC * uSunI * lam * (0.35 + 0.6 * cloudShad(p)) + uSunC * shaftMask(p) * 1.3 + FLASH_C * uFlash * (0.5 + 0.4 * n.y);
+        gl_FragColor = vec4(fog(base * light, p), 1.0);` + TAIL })));
+  }
+}
+
+// ---- layers/grass.js ----
+
+/* ═══ COMPONENT: Grass (vegetation) ═══
+   ~42k instanced blades bent by the shared wind field; tips backlit and
+   blazing inside the shaft corridor. Reads groundH for placement. */
+class Grass {
+  constructor(ctx) {
+    const { scene, U, rnd, rr } = ctx;
+    const N = 42000;
+    const blade = new THREE.PlaneGeometry(0.10, 1, 1, 3); blade.translate(0, 0.5, 0);
+    { const p = blade.attributes.position; for (let i = 0; i < p.count; i++) p.setX(i, p.getX(i) * (1 - p.getY(i) * 0.85)); }
+    const seeds = new Float32Array(N);
+    const mesh = new THREE.InstancedMesh(blade, new THREE.ShaderMaterial({
+      side: THREE.DoubleSide, uniforms: uniformsFor(U, {}),
+      vertexShader: G + /* glsl */`
+      attribute float aSeed; varying vec3 vP; varying float vH, vSeed;
+      void main(){ vSeed = aSeed; vec3 p = position; vH = p.y;
+        mat4 m = modelMatrix * instanceMatrix;
+        vec4 base = m * vec4(0.0, 0.0, 0.0, 1.0);
+        float w = windAt(base.xz, uTime) + 0.10 * sin(uTime * 2.6 + aSeed * 40.0) * uWind;
+        vec4 wp = m * vec4(p, 1.0);
+        float bend = w * p.y * p.y;
+        wp.x += bend * 1.1; wp.z += bend * 0.3; wp.y -= bend * bend * 0.4;
+        vP = wp.xyz; gl_Position = projectionMatrix * viewMatrix * wp; }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vP; varying float vH, vSeed; uniform vec3 uGrassA, uGrassB;
+      void main(){
+        vec3 col = mix(uGrassA, uGrassB, vH * vH * (0.6 + 0.6 * fract(vSeed * 7.3)));
+        float cs = cloudShad(vP), sm = shaftMask(vP);
+        col *= 0.35 + 0.75 * uSunI * cs;
+        col += uSunC * pow(vH, 5.0) * (0.2 * uSunI * cs + 1.4 * sm);
+        col += uSunC * sm * 0.5 * (0.4 + 0.6 * vH);                    /* backlit tips, blazing inside the shaft */
+        col += mix(uSkyHorizon, uSkyTop, 0.5) * 0.03;
+        col += FLASH_C * uFlash * (0.6 + 0.7 * vH);
+        gl_FragColor = vec4(fog(col, vP), 1.0);` + TAIL }), N);
+    const d = new THREE.Object3D();
+    for (let i = 0; i < N; i++) {
+      const near = i < N * 0.6;
+      const x = near ? rr(-70, 70) : rr(-BASIN_R, BASIN_R), z = near ? rr(-95, 30) : rr(-250, 40);
+      d.position.set(x, groundH(x, z) - 0.04, z);
+      d.rotation.set(0, rnd() * 6.283, (rnd() - 0.5) * 0.22);
+      const h = rr(0.6, 1.5) * (near ? 1 : 1.7); d.scale.set(near ? 1 : 1.8, h, 1);
+      d.updateMatrix(); mesh.setMatrixAt(i, d.matrix); seeds[i] = rnd();
+    }
+    blade.setAttribute('aSeed', new THREE.InstancedBufferAttribute(seeds, 1));
+    scene.add(mesh);
+  }
+}
+
+// ---- layers/outcrops.js ----
+
+/* ═══ COMPONENT: Outcrops ═══
+   Lichen-mottled granite boulders half-sunk in the turf; one big split erratic
+   near camera. Reads groundH for placement. */
+class Outcrops {
+  constructor(ctx) {
+    const { scene, rnd, rr } = ctx;
+    const g = new THREE.IcosahedronGeometry(1, 2), p = g.attributes.position, v = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) { v.fromBufferAttribute(p, i); v.multiplyScalar(1 + (fbmJ(v.x * 2 + 4, v.y * 2 + v.z, 3) - 0.5) * 0.34); p.setXYZ(i, v.x, v.y, v.z); }
+    g.computeVertexNormals();
+    const rocks = new THREE.InstancedMesh(g, matterMat(ctx, [0.55, 0.51, 0.45], { mottle: 1 }), 26), d = new THREE.Object3D();
+    for (let i = 0; i < 26; i++) {
+      const big = i < 2; const x = big ? rr(-30, -14) : rr(-BASIN_R * 0.7, BASIN_R * 0.7), z = big ? rr(-18, -4) : rr(-170, 20);
+      const s = big ? rr(2.4, 3.6) : rr(0.5, 1.8);
+      d.position.set(x, groundH(x, z) + s * 0.25, z); d.rotation.set(rnd() * 3, rnd() * 3, rnd() * 3);
+      d.scale.set(s, s * rr(0.55, 0.8), s * rr(0.7, 1.2)); d.updateMatrix(); rocks.setMatrixAt(i, d.matrix);
+    }
+    scene.add(rocks);
+  }
+}
+
+// ---- layers/mist.js ----
+
+/* ═══ COMPONENT: Mist ═══
+   Dawn mist ribbons lying in the creek hollows; brighten where the shaft
+   crosses them, gated by uMist. */
+class Mist {
+  constructor(ctx) {
+    const { scene, U, rr } = ctx;
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, uniforms: uniformsFor(U, {}),
+      vertexShader: `varying vec2 vUv; varying vec3 vP; void main(){ vUv = uv; vP = (modelMatrix * vec4(position, 1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      uniform float uMist; varying vec2 vUv; varying vec3 vP;
+      void main(){ float n = fbm2(vUv * vec2(5.0, 1.6) + vec2(uTime * 0.018, 0.0)) * 0.5 + 0.5;
+        float a = smoothstep(0.0, 0.25, vUv.y) * smoothstep(1.0, 0.55, vUv.y)
+                * smoothstep(0.0, 0.12, vUv.x) * smoothstep(1.0, 0.88, vUv.x) * n * 0.5 * uMist;
+        vec3 col = uFogC * (0.85 + 0.3 * uSunI) + uSunC * shaftMask(vP) * 0.5;
+        gl_FragColor = vec4(fog(col, vP), a);` + TAIL });
+    for (let i = 0; i < 5; i++) {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(220, 8), mat);
+      const z = -30 - i * 32; m.position.set(rr(-25, 40), groundH(20, z) + 2.2, z); m.renderOrder = 2; scene.add(m);
+    }
+  }
+}
+
+// ---- layers/shafts.js ----
+
+/* ═══ COMPONENT: Shafts (the hero) ═══
+   Additive light blades hanging from the saddle along uShaftDir; brightness
+   follows the shared shaftMask so the visible blades and the light on the
+   ground always agree. */
+class Shafts {
+  constructor(ctx) {
+    const { scene, U, rr } = ctx;
+    this.ctx = ctx;
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, uniforms: uniformsFor(U, {}),
+      vertexShader: `varying vec3 vP; varying vec2 vUv; void main(){ vUv = uv; vP = (modelMatrix * vec4(position, 1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vP; varying vec2 vUv;
+      void main(){ float edge = smoothstep(0.0, 0.3, vUv.x) * smoothstep(1.0, 0.7, vUv.x);
+        float blade = pow(edge, 1.4) * (0.45 + 0.55 * fbm2(vec2(vUv.x * 6.0, vUv.y * 2.0 - uTime * 0.10)));
+        float a = shaftMask(vP) * blade * (1.0 - vUv.y * 0.5) * fogAtt(vP);
+        gl_FragColor = vec4(uSunC * a * 1.8, 1.0);` + TAIL });
+    this.group = new THREE.Group();
+    for (let i = 0; i < 7; i++) {
+      const w = rr(4, 9), m = new THREE.Mesh(new THREE.PlaneGeometry(w, 300, 1, 1), mat);
+      m.userData.off = new THREE.Vector3(rr(-28, 28), 0, rr(-10, 10)); m.userData.rot = rr(-0.12, 0.12);
+      this.group.add(m);
+    }
+    this.group.renderOrder = 5; scene.add(this.group);
+  }
+  update() {
+    const dir = this.ctx.U.uShaftDir.value;
+    for (const m of this.group.children) {
+      /* each blade hangs from a point near the saddle and follows the shaft direction */
+      m.position.copy(SADDLE).add(m.userData.off).addScaledVector(dir, 140);
+      m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().negate());
+      m.rotateY(m.userData.rot);
+    }
+  }
+}
+
+// ---- layers/herd.js ----
+
+/* ═══ COMPONENT: Herd (fauna) ═══
+   Wild horses (barrel, neck, head+ears, mane ridge, tail, two-joint legs) with
+   graze / drift / trot behaviours; they bunch and run in the storm, settle at
+   dusk. Reads groundH + cur.herdMood/herdSpeed. */
+const HIDE = [[0.45, 0.32, 0.22], [0.28, 0.20, 0.15], [0.62, 0.55, 0.48], [0.20, 0.16, 0.14], [0.55, 0.38, 0.24]];
+class Herd {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.horses = [];
+    for (let i = 0; i < 7; i++) this.horses.push(this.makeHorse(HIDE[i % HIDE.length], i === 0 ? 1.12 : ctx.rr(0.9, 1.05), i));
+  }
+  makeHorse(tint, s, i) {
+    const ctx = this.ctx, { scene, rnd } = ctx;
+    const g = new THREE.Group();
+    const hide = matterMat(ctx, tint, { mottle: 0.25 }), dark = matterMat(ctx, [tint[0] * 0.45, tint[1] * 0.45, tint[2] * 0.45], { mottle: 0.15 });
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.44, 1.15, 6, 12), hide); body.rotation.z = Math.PI / 2; body.position.y = 1.45; body.scale.set(1, 1, 0.82); g.add(body);
+    const chest = new THREE.Mesh(new THREE.SphereGeometry(0.42, 10, 8), hide); chest.position.set(0.62, 1.42, 0); chest.scale.set(0.9, 1, 0.82); g.add(chest);
+    const rump = new THREE.Mesh(new THREE.SphereGeometry(0.44, 10, 8), hide); rump.position.set(-0.62, 1.5, 0); rump.scale.set(0.95, 1, 0.85); g.add(rump);
+    const neckP = new THREE.Group(); neckP.position.set(0.85, 1.72, 0); g.add(neckP);
+    const neck = new THREE.Mesh(new THREE.CapsuleGeometry(0.18, 0.72, 4, 8), hide); neck.position.set(0.24, 0.34, 0); neck.rotation.z = -0.72; neckP.add(neck);
+    const headP = new THREE.Group(); headP.position.set(0.52, 0.66, 0); neckP.add(headP);
+    const head = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.42, 4, 8), hide); head.rotation.z = Math.PI / 2 - 0.45; head.position.set(0.2, -0.05, 0); headP.add(head);
+    const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.115, 0.22, 8), dark); muzzle.rotation.z = Math.PI / 2 - 0.45; muzzle.position.set(0.42, -0.16, 0); headP.add(muzzle);
+    for (const sd of [-1, 1]) { const ear = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.17, 5), hide); ear.position.set(-0.02, 0.16, sd * 0.09); ear.rotation.x = sd * 0.25; headP.add(ear); }
+    /* mane: a ridge of flattened boxes along the neck top */
+    for (let k = 0; k < 5; k++) { const mm = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.22 - k * 0.02, 0.05), dark); mm.position.set(0.05 + k * 0.13, 0.30 + k * 0.13, 0); mm.rotation.z = -0.7; neckP.add(mm); }
+    const tail = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.75, 3, 6), dark); tail.position.set(-1.05, 1.35, 0); tail.rotation.z = 0.45; g.add(tail);
+    const legs = [];
+    const mkLeg = (x, z) => { const hip = new THREE.Group(); hip.position.set(x, 1.25, z);
+      const up = new THREE.Mesh(new THREE.CapsuleGeometry(0.10, 0.55, 3, 6), hide); up.position.y = -0.3; hip.add(up);
+      const knee = new THREE.Group(); knee.position.y = -0.6;
+      const lo = new THREE.Mesh(new THREE.CapsuleGeometry(0.065, 0.55, 3, 6), hide); lo.position.y = -0.3; knee.add(lo);
+      const hoof = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.065, 0.1, 6), dark); hoof.position.y = -0.62; knee.add(hoof);
+      hip.add(knee); g.add(hip); legs.push({ hip, knee }); };
+    mkLeg(0.62, 0.22); mkLeg(0.62, -0.22); mkLeg(-0.62, 0.22); mkLeg(-0.62, -0.22);
+    g.scale.setScalar(s); scene.add(g);
+    const a0 = rnd() * 6.283;
+    return { g, neckP, headP, tail, legs, x: 12 + Math.cos(a0) * ctx.rr(4, 16), z: -46 + Math.sin(a0) * ctx.rr(4, 14),
+             heading: rnd() * 6.283, speed: 0, mode: 'graze', timer: ctx.rr(1, 5), ph: rnd() * 6.283, s };
+  }
+  update(dt, t) {
+    const ctx = this.ctx, cur = ctx.cur, rnd = ctx.rnd, rr = ctx.rr, mood = cur.herdMood, spd = cur.herdSpeed;
+    for (const h of this.horses) {
+      h.timer -= dt;
+      if (h.timer <= 0) {
+        const r = rnd();
+        if (mood > 0.7) { h.mode = r < 0.75 ? 'run' : 'alert'; h.heading = -1.1 + rr(-0.35, 0.35); }       /* storm: run east together */
+        else h.mode = r < 0.5 ? 'graze' : r < 0.8 ? 'drift' : 'alert';
+        if (h.mode === 'drift') h.heading += rr(-1.2, 1.2);
+        h.timer = rr(2, 6) * (1.3 - mood * 0.8);
+      }
+      const want = h.mode === 'run' ? 5.2 : h.mode === 'drift' ? 1.1 : 0;
+      h.speed += (want * spd - h.speed) * dt * 2.2;
+      h.x += Math.cos(h.heading) * h.speed * dt; h.z += -Math.sin(h.heading) * h.speed * dt;
+      const dx = h.x - 12, dz = h.z + 46;                                                 /* keep to the home meadow */
+      if (dx * dx + dz * dz > 30 * 30) h.heading = Math.atan2(dz, -dx) + rr(-0.3, 0.3);
+      h.g.position.set(h.x, groundH(h.x, h.z), h.z); h.g.rotation.y = h.heading;
+      /* gait: walk = diagonal pairs; run = gallop-ish bound with body pitch */
+      const run = THREE.MathUtils.clamp(h.speed / 4, 0, 1);
+      const stride = t * (4.5 + 5.5 * run) * (0.25 + Math.min(1, h.speed)) + h.ph;
+      h.legs.forEach((l, i) => {
+        const phase = stride + (run > 0.5 ? (i < 2 ? 0 : Math.PI * 0.8) : (i === 0 || i === 3 ? 0 : Math.PI));
+        const amp = Math.min(1, h.speed) * (0.45 + 0.35 * run);
+        l.hip.rotation.z = Math.sin(phase) * amp;
+        l.knee.rotation.z = Math.max(0, -Math.cos(phase)) * (0.7 + 0.5 * run) * Math.min(1, h.speed);
+      });
+      h.g.position.y += Math.abs(Math.sin(stride * (run > 0.5 ? 0.5 : 1))) * 0.09 * run * h.s;
+      h.g.rotation.z = Math.sin(stride * 0.5) * 0.05 * run;
+      const neckWant = h.mode === 'graze' ? 0.95 : h.mode === 'alert' ? -0.30 : 0.1 + run * 0.25;
+      h.neckP.rotation.z += (neckWant - h.neckP.rotation.z) * dt * 3;
+      h.headP.rotation.y = h.mode === 'alert' ? Math.sin(t * 0.7 + h.ph) * 0.5 : 0;
+      h.headP.rotation.z = h.mode === 'graze' ? 0.35 + Math.sin(t * 1.4 + h.ph) * 0.08 : Math.sin(stride) * 0.05 * run;
+      h.tail.rotation.z = 0.45 + Math.sin(t * (1.5 + 3 * cur.wind) + h.ph) * (0.12 + 0.25 * cur.wind) + run * 0.5;
+    }
+  }
+}
+
+// ---- layers/airlife.js ----
+
+/* ═══ COMPONENT: AirLife ═══
+   A hawk circling the saddle thermal (big slow circles) and swallows low over
+   the grass. Point sprites drawn as little winged dashes. */
+class AirLife {
+  constructor(ctx) {
+    const { scene, U, rnd, rr, renderer } = ctx;
+    this.ctx = ctx;
+    const mk = (n, size) => {
+      const g = new THREE.BufferGeometry(), p = new Float32Array(n * 3), s = new Float32Array(n);
+      for (let i = 0; i < n; i++) { p.set([rr(-80, 80), rr(6, 30), rr(-120, 10)], i * 3); s[i] = rnd(); }
+      g.setAttribute('position', new THREE.BufferAttribute(p, 3)); g.setAttribute('aSeed', new THREE.BufferAttribute(s, 1));
+      const mat = new THREE.ShaderMaterial({ transparent: true, depthWrite: false,
+        uniforms: uniformsFor(U, { uVis: F(1), uPx: F(renderer.getPixelRatio()), uSize: F(size) }),
+        vertexShader: `attribute float aSeed; uniform float uTime, uPx, uVis, uSize; varying float vA, vFlap;
+        void main(){ vec3 p = position; float t = uTime * (0.5 + aSeed * 0.5) * ${size > 600 ? '0.22' : '1.0'};
+          p.x += sin(t + aSeed * 6.0) * ${size > 600 ? '38.0' : '26.0'}; p.z += cos(t * 1.2 + aSeed * 4.0) * ${size > 600 ? '26.0' : '18.0'};
+          p.y += sin(t * 2.2 + aSeed) * 2.5;
+          vFlap = sin(uTime * (${size > 600 ? '1.4' : '11.0'} + aSeed * 4.0)); vA = uVis * step(aSeed, uVis);
+          vec4 mv = modelViewMatrix * vec4(p, 1.0); gl_PointSize = uPx * uSize / max(-mv.z, 1.0); gl_Position = projectionMatrix * mv; }`,
+        fragmentShader: `varying float vA, vFlap; void main(){ vec2 c = gl_PointCoord - 0.5;
+          float wy = 0.15 * vFlap * (1.0 - abs(c.x) * 2.2);
+          float a = smoothstep(0.05, 0.0, abs(c.y - wy) - 0.013) * step(abs(c.x), 0.44);
+          gl_FragColor = vec4(vec3(0.10, 0.09, 0.10), a * vA); }` });
+      const pts = new THREE.Points(g, mat); scene.add(pts); return mat;
+    };
+    this.swallows = mk(10, 420);
+    this.hawkMat = mk(1, 1500);                       /* one hawk, big slow circles, near-fixed wings */
+  }
+  update() { const cur = this.ctx.cur; this.swallows.uniforms.uVis.value = Math.min(cur.hawk * 1.4, 1); this.hawkMat.uniforms.uVis.value = cur.hawk > 0.15 ? 1 : 0; }
+}
+
+// ---- layers/fluff.js ----
+
+/* ═══ COMPONENT: Fluff ═══
+   Wind-borne seed motes that catch the shafts; blow east and recycle, gated
+   by cur.fluff. */
+class Fluff {
+  constructor(ctx) {
+    const { scene, U, rnd, rr, renderer } = ctx;
+    this.ctx = ctx;
+    const N = 1600, p = new Float32Array(N * 3), s = new Float32Array(N);
+    for (let i = 0; i < N; i++) { p.set([rr(-110, 110), rr(0.5, 22), rr(-150, 25)], i * 3); s[i] = rnd(); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(p, 3)); g.setAttribute('aSeed', new THREE.BufferAttribute(s, 1));
+    const pts = new THREE.Points(g, new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      uniforms: uniformsFor(U, { uFluff: F(0.5), uPx: F(renderer.getPixelRatio()) }),
+      vertexShader: G + /* glsl */`
+      attribute float aSeed; uniform float uFluff, uPx; varying float vB, vA;
+      void main(){ vec3 p = position;
+        p.x = mod(p.x + uTime * (1.5 + 2.5 * aSeed) * (0.4 + uWind) + 110.0, 220.0) - 110.0;
+        p.y += sin(uTime * 0.7 + aSeed * 20.0) * 1.6; p.z += sin(uTime * 0.23 + aSeed * 9.0) * 4.0;
+        float sm = shaftMask(p);
+        vB = (0.10 + 0.25 * uSunI * cloudShad(p) + 2.2 * sm) * fogAtt(p);
+        vA = uFluff * step(aSeed, uFluff) * (0.5 + 1.5 * sm);
+        vec4 mv = viewMatrix * vec4(p, 1.0);
+        gl_PointSize = min((0.9 + 1.4 * aSeed) * uPx * 32.0 / max(-mv.z, 1.0), 5.0);
+        gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: /* glsl */`
+      varying float vB, vA;
+      void main(){ float r = length(gl_PointCoord - 0.5) * 2.0; float m = smoothstep(1.0, 0.3, r);
+        gl_FragColor = vec4(vec3(1.0, 0.96, 0.86) * vB, m * vA * 0.55);` + TAIL }));
+    pts.renderOrder = 6; scene.add(pts);
+    this.mat = pts.material;
+  }
+  update() { this.mat.uniforms.uFluff.value = this.ctx.cur.fluff; }
+}
+
+// ---- layers/rain.js ----
+
+/* ═══ COMPONENT: Rain (effects) ═══
+   Wind-sheared streaks wrapped around the moving camera so they always fill the
+   view; gated by cur.rain (inert outside the storm). */
+class Rain {
+  constructor(ctx) {
+    const { scene, U, rnd, rr, renderer } = ctx;
+    this.ctx = ctx;
+    const N = 9000, p = new Float32Array(N * 3), s = new Float32Array(N);
+    for (let i = 0; i < N; i++) { p[i * 3] = rr(-70, 70); p[i * 3 + 1] = rr(0, 60); p[i * 3 + 2] = rr(-95, 30); s[i] = rnd(); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(p, 3)); g.setAttribute('aSeed', new THREE.BufferAttribute(s, 1));
+    this.mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, uniforms: uniformsFor(U, { uRain: F(0), uPx: F(renderer.getPixelRatio()) }),
+      vertexShader: /* glsl */`attribute float aSeed; uniform float uTime, uRain, uWind, uPx; varying float vA;
+      void main(){ vec3 p = position;
+        float fall = mod(p.y - uTime * (34.0 + aSeed * 16.0), 60.0);
+        p.y = fall; p.x += (60.0 - fall) * 0.18 * (0.4 + uWind);                       /* wind shear leans the streaks */
+        /* keep the rain column wrapped around the moving camera so it always fills the view */
+        p.x = mod(p.x - cameraPosition.x + 70.0, 140.0) - 70.0 + cameraPosition.x;
+        p.z = mod(p.z - cameraPosition.z + 70.0, 140.0) - 70.0 + cameraPosition.z;
+        vA = uRain * step(aSeed, uRain);
+        vec4 mv = viewMatrix * vec4(p, 1.0);
+        gl_PointSize = uPx * clamp(120.0 / max(-mv.z, 1.0), 3.0, 22.0) * (0.7 + 0.6 * aSeed);
+        gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: /* glsl */`varying float vA;
+      void main(){ vec2 c = gl_PointCoord - 0.5;
+        float streak = smoothstep(0.5, 0.0, abs(c.x) * 7.0) * smoothstep(0.5, 0.05, abs(c.y));   /* tall thin dash */
+        gl_FragColor = vec4(vec3(0.75, 0.80, 0.88), streak * vA * 0.45); }` });
+    const pts = new THREE.Points(g, this.mat); pts.renderOrder = 7; pts.frustumCulled = false; scene.add(pts);
+  }
+  update() { this.mat.uniforms.uRain.value = this.ctx.cur.rain; }
+}
+
+// ---- layers/lightning.js ----
+
+const smoothstep2 = (x, a, b) => { const t = THREE.MathUtils.clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+/* ═══ COMPONENT: Lightning (effects) ═══
+   A jagged additive bolt in the saddle gap + synthesized thunder, gated to the
+   storm state. Writes the shared uFlash channel (sky/grass/prairie/matter read
+   it; PostFX boosts bloom/exposure from it). Note: this.ctx is the AudioContext,
+   so scene refs are held separately. */
+class Lightning {
+  constructor(sctx) {
+    const { scene, U, rr } = sctx;
+    this.U = U; this.camera = sctx.camera; this.rnd = sctx.rnd; this.rr = rr; this.cur = sctx.cur;
+    this.env = 0; this.next = rr(2.5, 6); this.t0 = -100; this.boltSeed = 0; this.ctx = null;
+    /* a jagged bolt drawn on an additive plane standing in the saddle gap */
+    const g = new THREE.PlaneGeometry(34, 120, 1, 1);
+    this.bolt = new THREE.Mesh(g, new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+      uniforms: uniformsFor(U, { uEnv: F(0), uSeed: F(0) }),
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`uniform float uEnv, uSeed; varying vec2 vUv;
+      void main(){ if (uEnv < 0.02) discard;
+        float y = 1.0 - vUv.y;                                                        /* strike from the top down */
+        /* jagged centreline: low-freq wander + a couple of sharp kinks */
+        float cx = 0.5 + 0.20 * (fbm2(vec2(y * 9.0 + uSeed * 40.0, uSeed)) - 0.47)
+                       + 0.10 * (fract(y * 3.0 + uSeed) - 0.5)
+                       + 0.03 * sin(y * 80.0 + uSeed * 12.0);
+        float d = abs(vUv.x - cx);
+        float core = smoothstep(0.022, 0.0, d);                                       /* crisp white filament */
+        float glow = smoothstep(0.13, 0.0, d) * 0.35;                                 /* tight halo */
+        /* two forked branches peeling off partway down */
+        float bx = cx + 0.22 * sign(fract(uSeed * 9.0) - 0.5);
+        float branch = smoothstep(0.016, 0.0, abs(vUv.x - bx * 0.5 - cx * 0.5)) * smoothstep(0.35, 0.05, abs(y - 0.6)) * step(0.5, fract(y * 5.0 + uSeed));
+        float a = (core + glow + branch * 0.7) * uEnv * smoothstep(0.0, 0.05, vUv.y) * smoothstep(1.0, 0.92, vUv.y);
+        gl_FragColor = vec4(FLASH_C * (3.0 + core * 6.0), a); }` }));
+    this.bolt.position.set(SADDLE.x - 60, SADDLE.y + 55, SADDLE.z + 70); this.bolt.renderOrder = 8; scene.add(this.bolt);
+    /* thunder is synthesized (no audio assets); only after a user gesture unlocks audio */
+    const unlock = () => { try { if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)(); if (this.ctx.state === 'suspended') this.ctx.resume(); } catch (e) {} };
+    window.addEventListener('pointerdown', unlock, { once: false });
+  }
+  strike() { this.t0 = this.U.uTime.value; this.boltSeed = this.rnd(); this.bolt.material.uniforms.uSeed.value = this.boltSeed;
+    this.bolt.position.x = SADDLE.x + (this.rnd() < 0.5 ? this.rr(-78, -34) : this.rr(34, 78)); this.thunder(); }   /* off to one side, over the peaks */
+  thunder() {
+    try {
+      const ctx = this.ctx; if (!ctx || ctx.state !== 'running') return;
+      const now = ctx.currentTime, delay = 0.5 + this.rnd() * 1.6, dur = 1.6 + this.rnd() * 1.4;   /* delay ≈ distance to the strike */
+      const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * dur), ctx.sampleRate), ch = buf.getChannelData(0);
+      let last = 0; for (let i = 0; i < ch.length; i++) { const w = Math.random() * 2 - 1; last = (last + 0.02 * w) / 1.02; ch[i] = last * 3.2; }   /* brown noise */
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 240; lp.Q.value = 0.7;
+      const gn = ctx.createGain(); gn.gain.setValueAtTime(0, now + delay);
+      gn.gain.linearRampToValueAtTime(0.45, now + delay + 0.08);
+      gn.gain.exponentialRampToValueAtTime(0.0008, now + delay + dur);
+      src.connect(lp); lp.connect(gn); gn.connect(ctx.destination); src.start(now + delay); src.stop(now + delay + dur);
+    } catch (e) {}
+  }
+  update(dt, t) {
+    const cur = this.cur;
+    if (cur.rain > 0.5) { this.next -= dt; if (this.next <= 0) { this.strike(); this.next = this.rr(3.5, 9); } }
+    const e = t - this.t0;
+    /* double-flicker envelope with a fast decay */
+    this.env = e < 0.45 ? Math.max(0, Math.exp(-e * 7.0) * (0.55 + 0.45 * Math.sin(e * 85.0)) * Math.min(1, e / 0.02)) * cur.rain : 0;
+    this.U.uFlash.value = this.env;
+    const be = smoothstep2(e, 0.0, 0.015) * (1.0 - smoothstep2(e, 0.10, 0.34));   /* a crisp stroke, held ~0.3s */
+    this.bolt.material.uniforms.uEnv.value = (e >= 0.0 && e < 0.45 ? be : 0.0) * cur.rain;
+    this.bolt.lookAt(this.camera.position.x, this.bolt.position.y, this.camera.position.z);
+  }
+}
+
+// ---- camera.js ----
+
+/* ═══ COMPONENT: Camera ═══
+   Slow arc along the knoll south of the meadow, breathing height, always
+   framing herd → basin → saddle in thirds. */
+class CameraRig {
+  constructor(ctx) { this.ctx = ctx; this.look = new THREE.Vector3(); }
+  update(dt, t) {
+    const camera = this.ctx.camera;
+    /* slow arc along the knoll south of the meadow, always framing herd → basin → saddle */
+    const a = t * 0.021, x = 16 + Math.sin(a) * 10, z = 20 + Math.cos(a * 0.7) * 5;
+    camera.position.set(x, groundH(x, z) + 4.0 + Math.sin(t * 0.09) * 0.35, z);
+    /* thirds: grass foreground, herd + basin, then ridge + saddle + sky */
+    this.look.set(4 + Math.sin(t * 0.045) * 8, groundH(4, -160) + 24 + Math.sin(t * 0.06) * 1.5, -160);
+    camera.lookAt(this.look);
+  }
+}
+
+// ---- postfx.js ----
+
+/* ═══ COMPONENT: PostFX ═══
+   Bloom + hand ACES/vignette; plain fallback. A lightning flash (the shared
+   uFlash channel, written by Lightning) boosts bloom and exposure. */
+class PostFX {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { renderer, scene, camera } = ctx;
+    try {
+      this.composer = new EffectComposer(renderer); this.composer.addPass(new RenderPass(scene, camera));
+      this.bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.35, 0.5, 0.9); this.composer.addPass(this.bloom);
+      this.out = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uExposure: F(1) },
+        vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform sampler2D tDiffuse; uniform float uExposure; varying vec2 vUv;
+        vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+        void main(){ vec3 c = texture2D(tDiffuse, vUv).rgb * uExposure; c = aces(c);
+          float v = 1.0 - 0.26 * pow(length(vUv - 0.5) * 1.35, 2.5);
+          gl_FragColor = vec4(pow(c * v, vec3(1.0 / 2.2)), 1.0); }` });
+      this.composer.addPass(this.out); renderer.toneMapping = THREE.NoToneMapping;
+    } catch (e) { console.warn('post-processing unavailable, plain render', e); this.composer = null; }
+  }
+  resize(w, h) { if (this.composer) { this.composer.setSize(w, h); this.bloom.setSize(w, h); } }
+  render() {
+    const { renderer, scene, camera, cur, U } = this.ctx;
+    const flash = U.uFlash.value;   /* Lightning writes uFlash == its env; keep PostFX layer-independent */
+    if (this.composer) { this.bloom.strength = cur.bloom + flash * 0.35; this.out.uniforms.uExposure.value = cur.exposure + flash * 0.42; this.composer.render(); }
+    else { renderer.toneMappingExposure = cur.exposure + flash * 0.42; renderer.render(scene, camera); }
+  }
+}
+
+// ---- scene.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE: High Park — a prairie basin under the peaks.
+   Enumerated manifest (SCENE_CONTRACT §8): four named states; default is the
+   second (cloud-shadows). Rain + lightning gate to storm-break only.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const STATES = {
+  'first-light': {
+    caption: 'Dawn. The summits take the first pink light while the basin waits in blue shadow, mist lying along the creek hollows.',
+    skyTop: [0.22, 0.30, 0.52], skyHorizon: [0.95, 0.68, 0.50], sunC: [1.0, 0.70, 0.45], sunI: 0.85, sunEl: 0.10,
+    peakSnow: [1.0, 0.78, 0.72], peakRock: [0.30, 0.26, 0.28], grassA: [0.16, 0.20, 0.12], grassB: [0.55, 0.48, 0.30],
+    fog: [0.66, 0.60, 0.62], fogD: 0.0016, wind: 0.30, cloud: 0.25, shadowAmt: 0.25, shaft: 0.75, shaftTilt: 0.42,
+    rain: 0.0, mist: 1.0, herdMood: 0.12, herdSpeed: 0.35, fluff: 0.35, hawk: 0.4, stars: 0.12, bloom: 0.35, exposure: 1.0 },
+  'cloud-shadows': {
+    caption: 'Mid-morning wind. Cumulus shadows race each other across the park, and the herd grazes through light and dark without looking up.',
+    skyTop: [0.24, 0.48, 0.86], skyHorizon: [0.76, 0.85, 0.92], sunC: [1.0, 0.98, 0.92], sunI: 1.45, sunEl: 0.75,
+    peakSnow: [0.97, 0.98, 1.0], peakRock: [0.38, 0.36, 0.34], grassA: [0.15, 0.26, 0.10], grassB: [0.62, 0.60, 0.26],
+    fog: [0.74, 0.82, 0.90], fogD: 0.0008, wind: 1.0, cloud: 0.6, shadowAmt: 1.0, shaft: 0.18, shaftTilt: 0.05,
+    rain: 0.0, mist: 0.0, herdMood: 0.25, herdSpeed: 0.7, fluff: 1.0, hawk: 1.0, stars: 0.0, bloom: 0.22, exposure: 1.08 },
+  'storm-break': {
+    caption: 'A shelf of storm shuts the sky — then splits at the saddle, and one great blade of sun walks across the basin. The horses run ahead of it.',
+    skyTop: [0.20, 0.22, 0.28], skyHorizon: [0.48, 0.46, 0.44], sunC: [1.0, 0.88, 0.62], sunI: 0.95, sunEl: 0.35,
+    peakSnow: [0.72, 0.74, 0.80], peakRock: [0.20, 0.20, 0.23], grassA: [0.11, 0.17, 0.08], grassB: [0.44, 0.42, 0.20],
+    fog: [0.44, 0.45, 0.48], fogD: 0.0019, wind: 2.1, cloud: 0.95, shadowAmt: 0.55, shaft: 1.6, shaftTilt: 0.22,
+    rain: 1.0, mist: 0.15, herdMood: 1.0, herdSpeed: 1.6, fluff: 0.55, hawk: 0.0, stars: 0.0, bloom: 0.5, exposure: 0.98 },
+  'gold-dusk': {
+    caption: 'The sun goes down exactly in the gap. Long gold light combs the seed heads, the hawk drops home, and the herd stands quiet, ears loose.',
+    skyTop: [0.20, 0.15, 0.36], skyHorizon: [1.0, 0.60, 0.30], sunC: [1.0, 0.62, 0.32], sunI: 1.15, sunEl: 0.05,
+    peakSnow: [1.0, 0.66, 0.55], peakRock: [0.28, 0.19, 0.20], grassA: [0.20, 0.15, 0.08], grassB: [0.95, 0.62, 0.26],
+    fog: [0.72, 0.48, 0.36], fogD: 0.0020, wind: 0.4, cloud: 0.35, shadowAmt: 0.3, shaft: 1.1, shaftTilt: 0.02,
+    rain: 0.0, mist: 0.3, herdMood: 0.18, herdSpeed: 0.3, fluff: 0.7, hawk: 0.3, stars: 0.3, bloom: 0.5, exposure: 1.12 },
+};
+const ORDER = Object.keys(STATES);
+const isColor = (k) => Array.isArray(STATES[ORDER[0]][k]);
+
+const sceneDef = {
+  meta: { fov: 48, near: 0.1, far: 1600, pixelRatio: 1.5, rate: 1.1, seed: 11, toneMapping: 'ACESFilmicToneMapping' },
+
+  buildUniforms() {
+    return {
+      uTime: F(0), uSkyTop: C3(), uSkyHorizon: C3(), uSunC: C3(), uSunI: F(1), uSunDir: V3(0, 0.3, -1),
+      uFogC: C3(), uFogD: F(0.003), uWind: F(0.5), uCloud: F(0.5), uShadowAmt: F(0.5),
+      uShaft: F(0.5), uShaftDir: V3(0, -0.5, 0.86), uSaddle: V3(SADDLE.x, SADDLE.y, SADDLE.z),
+      uGrassA: C3(), uGrassB: C3(), uMist: F(0), uStars: F(0), uFlash: F(0),
+    };
+  },
+
+  initialState() { const h = location.hash.slice(1); return STATES[h] ? h : ORDER[1]; },
+
+  resolveState(name) {
+    const s = STATES[STATES[name] ? name : ORDER[1]];
+    const t = {};
+    for (const k in s) { if (k === 'caption') continue; t[k] = isColor(k) ? new THREE.Color(...s[k]) : s[k]; }
+    return t;
+  },
+
+  applyToUniforms(cur, ctx) {
+    const U = ctx.U;
+    U.uSkyTop.value.copy(cur.skyTop); U.uSkyHorizon.value.copy(cur.skyHorizon); U.uSunC.value.copy(cur.sunC); U.uSunI.value = cur.sunI;
+    U.uFogC.value.copy(cur.fog); U.uFogD.value = cur.fogD; U.uWind.value = cur.wind; U.uCloud.value = cur.cloud; U.uShadowAmt.value = cur.shadowAmt;
+    U.uGrassA.value.copy(cur.grassA); U.uGrassB.value.copy(cur.grassB); U.uMist.value = cur.mist; U.uStars.value = cur.stars;
+    /* the sun sits above the saddle; the shaft corridor leans with shaftTilt through the day */
+    U.uSunDir.value.set(Math.sin(cur.shaftTilt) * 0.6, Math.max(cur.sunEl, 0.03), -0.9).normalize();
+    U.uShaft.value = cur.shaft;
+    U.uShaftDir.value.set(Math.sin(cur.shaftTilt), -0.80, 0.55).normalize();
+  },
+
+  layers: [Atmosphere, Peaks, Prairie, Grass, Outcrops, Mist, Shafts, Herd, AirLife, Fluff, Rain, Lightning],
+  camera: CameraRig,
+  postfx: PostFX,
+
+  onHashChange(sm) { const name = STATES[location.hash.slice(1)] ? location.hash.slice(1) : ORDER[1]; sm.setState(name); showState(name); },
+
+  setupUI(ctx, sm) {
+    captionEl = document.getElementById('caption'); nav = document.getElementById('nav');
+    ORDER.forEach((n) => { const b = document.createElement('button'); b.textContent = n; b.dataset.state = n; b.addEventListener('click', () => { location.hash = n; }); nav.appendChild(b); });
+    showState(sceneDef.initialState(), true);
+  },
+};
+
+// ---- caption + nav ----
+let captionEl, nav;
+function showState(name, instant = false) {
+  nav.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.state === name));
+  captionEl.classList.add('fade');
+  setTimeout(() => { captionEl.textContent = STATES[name].caption; captionEl.classList.remove('fade'); }, instant ? 0 : 500);
+}
+
+boot(document.getElementById('scene'), sceneDef);
+
+</script>
+</body>
+</html>

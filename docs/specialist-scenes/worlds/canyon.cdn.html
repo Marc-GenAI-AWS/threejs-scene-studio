@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Canyon — a slot canyon under hard desert light</title>
+<meta name="states" content="dawn-rim,high-noon,dust-storm,night-cold" />
+<style>
+  :root { --ink: #e6f2f0; --ink-dim: rgba(230,242,240,.42); --ink-mid: rgba(230,242,240,.74); --hairline: rgba(230,242,240,.16); }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #041418; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; color: var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #ui::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 220px; background: linear-gradient(transparent, rgba(2,10,14,.55)); z-index: -1; }
+  header { display: flex; justify-content: space-between; align-items: baseline; padding: 22px 28px; }
+  .mark { font-size: 12px; font-weight: 500; letter-spacing: .34em; text-shadow: 0 1px 8px rgba(0,0,0,.5); }
+  .mark small { letter-spacing: .2em; font-weight: 400; color: var(--ink-dim); margin-left: 1.2em; font-size: 10px; }
+  .hint { font-size: 10px; letter-spacing: .12em; color: var(--ink-dim); }
+  footer { padding: 0 28px 26px; max-width: 720px; }
+  #caption { font-family: Georgia, "Times New Roman", serif; font-style: italic; font-size: 18px; line-height: 1.45; color: var(--ink-mid);
+    text-shadow: 0 1px 10px rgba(0,0,0,.6); min-height: 2.9em; transition: opacity .6s; }
+  #caption.fade { opacity: 0; }
+  nav { display: flex; gap: 8px; margin-top: 16px; pointer-events: auto; flex-wrap: wrap; }
+  nav button { appearance: none; background: transparent; border: 1px solid var(--hairline); color: var(--ink-dim); font: inherit; font-size: 10px;
+    letter-spacing: .2em; text-transform: uppercase; padding: 8px 14px; border-radius: 16px; cursor: pointer; transition: all .4s; backdrop-filter: blur(6px); }
+  nav button:hover { color: var(--ink); border-color: rgba(230,242,240,.4); }
+  nav button.on { color: #061418; background: rgba(190, 232, 226, .9); border-color: transparent; }
+  @media (max-width: 560px) { #caption { font-size: 15px; } }
+</style>
+<script type="importmap">
+  { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="ui">
+  <header><div class="mark">CENOTE <small>SKYLIGHT</small></div><div class="hint">#state in the URL selects a scene</div></header>
+  <footer><div id="caption"></div><nav id="nav"></nav></footer>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ---- ../contract/runtime.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE CONTRACT — shared runtime (v1)
+   The scene-agnostic engine every scene boots against. See SCENE_CONTRACT.md.
+   Provides: uniform helpers, a seeded RNG, a state machine (enumerated OR
+   factored manifest), and the assembler loop. A scene supplies a `sceneDef`
+   (uniforms, layer classes, camera, state resolver, per-frame apply) to boot().
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* uniform helpers — a ShaderMaterial's uniforms is uniformsFor({...locals}) */
+const F  = (v) => ({ value: v });
+const C3 = () => ({ value: new THREE.Color() });
+const V3 = (x = 0, y = 0, z = 0) => ({ value: new THREE.Vector3(x, y, z) });
+const uniformsFor = (U, extra = {}) => ({ ...U, ...extra });
+
+/* deterministic RNG (park–miller); no Math.random in scene code */
+function makeRNG(seed = 7) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  const rr = (a, b) => a + (b - a) * rnd();
+  return { rnd, rr };
+}
+
+/* cur → target exponential interpolation of every visual parameter.
+   `resolve(name)` returns a fresh target object (numbers, THREE.Color, THREE.Vector3).
+   Colors/Vectors lerp via .lerp; numbers lerp arithmetically. */
+class StateMachine {
+  constructor({ initial, resolve, rate = 1.2, onApply }) {
+    this.resolve = resolve; this.rate = rate; this.onApply = onApply;
+    this.cur = {}; this.target = {};
+    this.setState(initial, true);
+  }
+  setState(name, instant = false) {
+    const t = this.resolve(name);
+    for (const k in t) if (!(k in this.cur)) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+    this.target = t;
+    if (instant) for (const k in t) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+  }
+  tick(dt, t, ctx) {
+    const k = 1 - Math.exp(-dt * this.rate), cur = this.cur, tg = this.target;
+    for (const key in tg) {
+      const c = cur[key], target = tg[key];
+      if (typeof c === 'number') cur[key] = c + (target - c) * k;
+      else if (c && c.lerp) c.lerp(target, k);
+    }
+    if (this.onApply) this.onApply(cur, ctx, t);
+  }
+}
+
+/* boot the frozen skeleton: renderer, scene, camera, layers[], main loop.
+   sceneDef: { meta, buildUniforms(), resolveState(name), initialState(),
+               applyToUniforms(cur,ctx,t), layers:[Class], camera:Class,
+               postfx?:Class, setupUI?(ctx,sm), onHashChange?(sm) } */
+function boot(canvas, sceneDef) {
+  const meta = sceneDef.meta || {};
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, meta.pixelRatio ?? 2));
+  renderer.setSize(innerWidth, innerHeight);
+  if (meta.toneMapping && THREE[meta.toneMapping]) renderer.toneMapping = THREE[meta.toneMapping];
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(meta.fov ?? 55, innerWidth / innerHeight, meta.near ?? 0.5, meta.far ?? 10000);
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const { rnd, rr } = makeRNG(meta.seed ?? 7);
+  const U = sceneDef.buildUniforms();
+  const ctx = { THREE, renderer, scene, camera, U, rnd, rr, reducedMotion, cur: null };
+
+  const sm = new StateMachine({
+    initial: sceneDef.initialState(),
+    resolve: (name) => sceneDef.resolveState(name),
+    rate: meta.rate ?? 1.2,
+    onApply: (cur, c, t) => sceneDef.applyToUniforms(cur, c, t),
+  });
+  ctx.cur = sm.cur;
+
+  // scene-level setup (background, renderer tweaks) before layers are built
+  if (sceneDef.setup) sceneDef.setup(ctx);
+
+  const layers = (sceneDef.layers || []).map((L) => new L(ctx));
+  const rig = sceneDef.camera ? new sceneDef.camera(ctx) : null;
+  const post = sceneDef.postfx ? new sceneDef.postfx(ctx) : null;
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); if (post && post.resize) post.resize(innerWidth, innerHeight);
+  });
+  addEventListener('hashchange', () => sceneDef.onHashChange ? sceneDef.onHashChange(sm) : sm.setState(location.hash.slice(1)));
+  if (sceneDef.setupUI) sceneDef.setupUI(ctx, sm);
+
+  const clock = new THREE.Clock(); let t = 0;
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05); t += dt;
+    U.uTime.value = t;
+    sm.tick(dt, t, ctx);
+    if (rig) rig.update(dt, t, ctx);
+    for (const l of layers) if (l.update) l.update(dt, t);
+    if (post) post.render(); else renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+  return { ctx, sm, layers, rig, post };
+}
+
+// ---- field.js ----
+
+// Canyon geometry constants + the shared floor/wall height field. The CPU noise
+// mirrors the GLSL noise so geometry, scrub placement and the camera agree.
+
+const LEN = 260;          // corridor runs along -z
+const HALF = 46;          // plane half-width in x
+const RIM = 34;           // wall height at the rim
+const FLOOR_Y = 0;        // nominal floor
+
+const hashJ = (x, y, z) => { const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453; return s - Math.floor(s); };
+const lerp = (a, b, t) => a + (b - a) * t;
+function vnoise(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z); let xf = x - xi, yf = y - yi, zf = z - zi;
+  xf = xf * xf * (3 - 2 * xf); yf = yf * yf * (3 - 2 * yf); zf = zf * zf * (3 - 2 * zf);
+  const c = (dy, dz) => lerp(hashJ(xi, yi + dy, zi + dz), hashJ(xi + 1, yi + dy, zi + dz), xf);
+  return lerp(lerp(c(0, 0), c(1, 0), yf), lerp(c(0, 1), c(1, 1), yf), zf);
+}
+function fbmJ(x, y, z, o = 4) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < o; i++) { s += a * vnoise(x, y, z); x = x * 2.03 + 1.3; y = y * 2.01 + 0.7; z = z * 1.97 + 2.1; a *= 0.5; }
+  return s;
+}
+
+// The corridor meanders in x as it runs along z, and pinches and opens.
+const meander = (z) => 7.5 * Math.sin(z * 0.021) + 3.2 * Math.sin(z * 0.047 + 1.7);
+const halfWidth = (z) => 9.5 + 4.5 * Math.sin(z * 0.033 + 0.6) + 2.0 * fbmJ(0, 3, z * 0.05, 2);
+
+// domain: |x| <= HALF, |z| <= LEN/2; range: ~0 on the floor up to RIM at the rim.
+// Owned by Walls; sampled by Scrub/Dust placement and the CameraRig.
+const canyonH = (x, z) => {
+  const d = Math.abs(x - meander(z)) - halfWidth(z);           // <0 inside the slot
+  const floor = 0.55 * fbmJ(x * 0.08, 0, z * 0.08, 3) + 0.22 * Math.sin(z * 0.3 + 2.0 * fbmJ(x * 0.2, 1, z * 0.1, 2));
+  if (d <= 0) return FLOOR_Y + floor;
+  const climb = Math.min(1, d / 26) ** 0.72;                    // steep near the base, easing to the rim
+  const ledges = 1.6 * Math.sin(d * 0.55 + 3.0 * fbmJ(x * 0.05, 5, z * 0.05, 2));
+  return FLOOR_Y + floor + RIM * climb + ledges * Math.min(1, d / 8);
+};
+
+// A convenient "is this point on the open floor" test for placement code.
+const inSlot = (x, z) => Math.abs(x - meander(z)) < halfWidth(z) - 1.2;
+
+const UP = new THREE.Vector3(0, 1, 0);
+
+// ---- prelude.glsl.js ----
+
+// Canyon GLSL prelude. G = core noise + this world's fields (strata, slot shadow,
+// wall bounce, dust haze). VERT_WORLD / FRAG_ROCK are the base shaders every rock
+// material derives from by string-surgery. TAIL is the tonemap/colorspace close.
+//
+// The distinctive field here is bounce(): in a slot canyon most of the light on a
+// shaded wall arrives off the opposite SUNLIT wall, not from the sky. Layers that
+// ignore it read as flat cut-outs.
+
+const G = /* glsl */`
+uniform float uTime; uniform vec3 uHazeC; uniform float uHazeD;
+uniform vec3 uSunDir, uSunC; uniform float uSunI; uniform vec3 uSkyC; uniform float uSkyI;
+uniform vec3 uBounceC; uniform float uBounceI; uniform float uDust, uShimmer, uStrata, uMoon, uStars, uRimY;
+uniform vec2 uWind;
+float hash1(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+vec2 hash2(vec2 p){ return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
+float noise3(vec3 p){ vec3 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash1(i), hash1(i+vec3(1,0,0)), f.x), mix(hash1(i+vec3(0,1,0)), hash1(i+vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash1(i+vec3(0,0,1)), hash1(i+vec3(1,0,1)), f.x), mix(hash1(i+vec3(0,1,1)), hash1(i+vec3(1,1,1)), f.x), f.y), f.z); }
+const mat3 ROT = mat3(0.36, 0.48, -0.8, -0.8, 0.6, 0.0, 0.48, 0.64, 0.6);
+float fbm3(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * noise3(p); p = ROT * p * 2.03 + 1.7; a *= 0.5; } return s; }
+float fbm2(vec2 p){ return fbm3(vec3(p, 0.37)); }
+
+/* sedimentary banding: the signature of this world's rock. Bands run level in y
+   and wobble slowly, so they read across every wall at once. */
+float strata(vec3 p){ float y = p.y * 0.42 + 0.9 * fbm2(p.xz * 0.035) + 0.25 * fbm3(p * 0.11);
+  float band = 0.5 + 0.5 * sin(y * 6.2831); return mix(1.0, 0.55 + 0.9 * band, uStrata); }
+
+/* hard light down a narrow slot: lit only where the point can see the strip of sky. */
+float slotLight(vec3 p){ float openness = smoothstep(-2.0, 16.0, p.y) ;
+  float ridge = fbm2(p.xz * 0.05 + 11.0);
+  return clamp(openness * (0.55 + 0.6 * ridge), 0.0, 1.5); }
+
+/* light bounced off the opposite sunlit wall - warm, broad, and strongest low down. */
+vec3 bounce(vec3 p, vec3 n){ float low = smoothstep(uRimY, -2.0, p.y);
+  float facing = 0.5 + 0.5 * dot(n, normalize(vec3(-uSunDir.x, 0.25, -uSunDir.z)));
+  return uBounceC * uBounceI * low * facing; }
+
+/* airborne dust: a warm forward-scattering haze that thickens with distance. */
+vec3 haze(vec3 col, vec3 p){ float d = distance(p, cameraPosition);
+  float k = uHazeD * (1.0 + 1.6 * uDust) * (1.0 - 0.45 * smoothstep(0.0, 30.0, p.y));
+  return mix(col, uHazeC, 1.0 - exp(-d * d * k * k)); }
+float hazeAtt(vec3 p){ float d = distance(p, cameraPosition);
+  float k = uHazeD * (1.0 + 1.6 * uDust); return exp(-d * d * k * k); }
+
+/* wind on the floor, used by scrub sway and dust drift. */
+vec2 windAt(vec3 p){ return uWind * (0.6 + 0.8 * fbm2(p.xz * 0.04 + uTime * 0.06)); }
+`;
+
+const VERT_WORLD = /* glsl */`
+varying vec3 vP, vN; uniform float uSway; uniform float uTime; uniform vec2 uWind;
+void main(){
+  #ifdef USE_INSTANCING
+  mat4 m = modelMatrix * instanceMatrix;
+  #else
+  mat4 m = modelMatrix;
+  #endif
+  vec4 wp = m * vec4(position, 1.0);
+  if (uSway > 0.0) { float s = clamp(wp.y / 3.0, 0.0, 1.0); s *= s;
+    wp.xz += uSway * s * (uWind * 0.7 + vec2(sin(uTime * 1.7 + wp.z * 0.5), cos(uTime * 1.3 + wp.x * 0.6)) * 0.35); }
+  vP = wp.xyz; vN = normalize(mat3(m) * normal); gl_Position = projectionMatrix * viewMatrix * wp; }`;
+
+const FRAG_ROCK = G + /* glsl */`
+varying vec3 vP, vN; uniform vec3 uRockC; uniform float uGrain;
+void main(){ vec3 p = vP;
+  vec3 n = normalize(normalize(vN)
+    + 0.40 * vec3(noise3(p * 0.5 + 1.0) - 0.5, noise3(p * 0.5 + 2.0) - 0.5, noise3(p * 0.5 + 3.0) - 0.5)
+    + 0.30 * vec3(noise3(p * 1.7 + 1.0) - 0.5, noise3(p * 1.7 + 2.0) - 0.5, noise3(p * 1.7 + 3.0) - 0.5)
+    + 0.10 * vec3(noise3(p * 6.0) - 0.5, noise3(p * 6.0 + 4.0) - 0.5, noise3(p * 6.0 + 8.0) - 0.5));
+  float m = fbm3(p * 0.28), m2 = fbm3(p * 1.4 + 9.0);
+  vec3 base = uRockC * strata(p) * (1.0 - uGrain * 0.35 + uGrain * 0.8 * m) * (0.82 + 0.26 * m2);
+  base *= 0.72 + 0.28 * smoothstep(-1.0, 4.0, p.y);                      /* dust-stained at the base */
+  float lam = max(dot(n, -uSunDir), 0.0), sl = slotLight(p);
+  vec3 light = uSkyC * uSkyI * (0.35 + 0.65 * max(n.y, 0.0)) * (0.4 + 0.6 * sl)
+             + uSunC * uSunI * lam * sl
+             + bounce(p, n)
+             + uSkyC * uMoon * 0.12 * (0.4 + 0.6 * max(n.y, 0.0));
+  gl_FragColor = vec4(haze(base * light, p), 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+const TAIL = /* glsl */`
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+// ---- materials.js ----
+
+// Material factories built by string-surgery on the shared bases. Layers should
+// reach for these before writing a raw ShaderMaterial: they carry this world's
+// strata, bounce light and dust haze, so a mesh sits in the canyon rather than
+// beside it.
+
+const rockMat = (ctx, rock, opts = {}) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, {
+    uRockC: { value: new THREE.Color(...rock) },
+    uGrain: F(opts.grain ?? 1),
+    uSway: F(opts.sway ?? 0),
+  }),
+  vertexShader: VERT_WORLD, fragmentShader: FRAG_ROCK, side: opts.side ?? THREE.FrontSide,
+});
+
+// Scrub: rock shading plus per-instance colour and a dryness wash, so vegetation
+// answers the state's `scrubDry` the way the rock answers `strata`.
+const VERT_SCRUB = VERT_WORLD
+  .replace('varying vec3 vP, vN;', 'varying vec3 vP, vN, vCol; varying vec2 vUv; attribute vec3 aCol;')
+  .replace('vP = wp.xyz;', 'vP = wp.xyz; vCol = aCol; vUv = uv;');
+
+// A quad is a rectangle; a bush is not. Carve the silhouette out of the quad with
+// an alpha discard — tapering toward the top and eroded by noise — or the scrub
+// reads as coloured cardboard standing in the corridor.
+const FRAG_SCRUB = FRAG_ROCK
+  .replace('uniform vec3 uRockC; uniform float uGrain;',
+           'uniform vec3 uRockC; uniform float uGrain, uDry; varying vec3 vCol; varying vec2 vUv;')
+  .replace('void main(){ vec3 p = vP;', `void main(){ vec3 p = vP;
+  /* per-bush offset so neighbouring instances are not the same silhouette */
+  vec2 bo = floor(p.xz * 3.0);
+  float rad = abs(vUv.x - 0.5) * 2.0;
+  float y = clamp(vUv.y, 0.0, 1.0);
+  /* lumpy profile: a taper broken by a few lobes, so it is not a clean triangle */
+  float lobes = 0.60 + 0.40 * fbm2(vec2(y * 3.5, 0.0) + bo)
+              + 0.22 * sin(y * 11.0 + fbm2(bo) * 6.28);
+  float prof = (1.0 - pow(y, 1.35)) * lobes;
+  float erode = 0.55 + 0.75 * fbm2(vec2(vUv.x * 16.0, y * 22.0) + bo * 3.1);
+  if (rad > prof * erode) discard;
+  if (fbm2(vec2(vUv.x * 26.0, y * 34.0) + bo * 7.7) < 0.40) discard;   /* open it into twigs */`)
+  .replace('vec3 base = uRockC * strata(p) * ',
+           'vec3 base = mix(vCol, vec3(0.62, 0.53, 0.34), uDry * 0.8) * (0.8 + 0.35 * noise3(p * 14.0)) * ');
+
+const scrubMat = (ctx) => new THREE.ShaderMaterial({
+  uniforms: uniformsFor(ctx.U, { uRockC: C3(), uGrain: F(0.3), uSway: F(1), uDry: ctx.U.uDry }),
+  vertexShader: VERT_SCRUB, fragmentShader: FRAG_SCRUB, side: THREE.DoubleSide,
+});
+
+// ---- layers/walls.js ----
+
+/* ═══ COMPONENT: Walls (the ground) ═══
+   One mesh carrying both the canyon floor and the walls that rise from it. Every
+   vertex's y comes from canyonH(x, z) — the shared height field the scrub, the
+   raptors' updraft and the camera all sample, so nothing floats or sinks. */
+class Walls {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const g = new THREE.PlaneGeometry(HALF * 2, LEN, 200, 340);
+    g.rotateX(-Math.PI / 2);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      pos.setY(i, canyonH(pos.getX(i), pos.getZ(i)));
+    }
+    pos.needsUpdate = true;
+    g.computeVertexNormals();
+
+    this.mesh = new THREE.Mesh(g, rockMat(ctx, [0.62, 0.34, 0.22], { grain: 1.0 }));
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+  }
+  update() { /* static geometry; all state response lives in the shared uniforms */ }
+}
+
+// ---- layers/firmament.js ----
+
+/* ═══ COMPONENT: Firmament (the sky) ═══
+   From the floor of a slot canyon the sky is a bright ribbon overhead, not a dome
+   you stand under. It is the brightest thing in frame by a wide margin at noon and
+   the only light source at night, so it carries the sun disc, the moon and stars. */
+class Firmament {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const geo = new THREE.SphereGeometry(300, 48, 32);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, fog: false,
+      uniforms: uniformsFor(ctx.U, {}),
+      vertexShader: `varying vec3 vDir;
+        void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: G + /* glsl */`
+      varying vec3 vDir;
+      void main(){
+        vec3 d = normalize(vDir);
+        float up = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+        /* desert sky: deep overhead, bleached and dusty toward the horizon */
+        vec3 col = mix(uHazeC, uSkyC, pow(up, 0.65)) * uSkyI;
+
+        /* sun disc and its aureole */
+        float sd = max(dot(d, -uSunDir), 0.0);
+        col += uSunC * uSunI * (pow(sd, 900.0) * 6.0 + pow(sd, 22.0) * 0.30 + pow(sd, 5.0) * 0.06);
+
+        /* moon and stars, only where the night states raise them */
+        if (uStars > 0.001) {
+          vec3 sp = d * 90.0;
+          float tw = noise3(floor(sp) + 0.5);
+          float star = step(0.9965, hash1(floor(sp))) * (0.55 + 0.45 * sin(uTime * 2.0 + tw * 31.4));
+          col += vec3(0.85, 0.9, 1.0) * star * uStars * smoothstep(0.05, 0.5, d.y);
+        }
+        if (uMoon > 0.001) {
+          float md = max(dot(d, normalize(vec3(0.35, 0.72, -0.6))), 0.0);
+          col += vec3(0.8, 0.86, 1.0) * uMoon * (pow(md, 2200.0) * 5.0 + pow(md, 26.0) * 0.12);
+        }
+
+        /* airborne dust washes the whole ribbon out */
+        col = mix(col, uHazeC * (0.7 + 0.5 * uSkyI), uDust * 0.55);
+        gl_FragColor = vec4(col, 1.0);
+      ` + TAIL,
+    });
+    this.mesh = new THREE.Mesh(geo, mat);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+  }
+  update() { const { camera } = this.ctx; this.mesh.position.copy(camera.position); }
+}
+
+// ---- layers/scrub.js ----
+
+/* ═══ COMPONENT: Scrub (the vegetation) ═══
+   Hardy desert brush: sparse on the open floor, clustered where runoff collects
+   against the wall feet. Instanced crossed quads — cheap, and enough to read as
+   brush at the camera's distance. Sways with uWind through VERT_SCRUB.
+
+   InstancedMesh, not InstancedBufferGeometry: only InstancedMesh makes three.js
+   define USE_INSTANCING, which VERT_WORLD needs to see instanceMatrix at all. */
+class Scrub {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr, rnd } = ctx;
+    const N = 1100;
+
+    const geo = crossedQuads();
+    this.mesh = new THREE.InstancedMesh(geo, scrubMat(ctx), N);
+    this.mesh.frustumCulled = false;
+
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
+    const up = new THREE.Vector3(0, 1, 0);
+    const cols = new Float32Array(N * 3);
+    let n = 0, guard = 0;
+    while (n < N && guard++ < N * 40) {
+      const z = rr(-LEN / 2 + 6, LEN / 2 - 6);
+      const hw = halfWidth(z);
+      // bias toward the wall feet, where the little water there is collects
+      const edge = rnd() < 0.62 ? (rnd() < 0.5 ? -1 : 1) * rr(0.55, 0.98) : rr(-0.5, 0.5);
+      const x = meander(z) + edge * hw;
+      if (!inSlot(x, z)) continue;
+      const h = rr(0.35, 1.15);
+      p.set(x, canyonH(x, z) - 0.05, z);
+      q.setFromAxisAngle(up, rr(0, Math.PI * 2));
+      s.set(h * rr(0.7, 1.2), h, h * rr(0.7, 1.2));
+      this.mesh.setMatrixAt(n, m.compose(p, q, s));
+      const dry = rr(0, 1);
+      cols[n * 3] = 0.26 + 0.32 * dry;
+      cols[n * 3 + 1] = 0.33 - 0.07 * dry;
+      cols[n * 3 + 2] = 0.15 + 0.06 * dry;
+      n++;
+    }
+    this.mesh.count = n;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    geo.setAttribute('aCol', new THREE.InstancedBufferAttribute(cols, 3));
+    ctx.scene.add(this.mesh);
+  }
+  update() { /* sway is driven by uWind/uTime inside VERT_SCRUB */ }
+}
+
+/* two quads crossed at right angles, built explicitly so there is no dependency
+   on BufferGeometryUtils being present in the assembled bundle. */
+function crossedQuads() {
+  const g = new THREE.BufferGeometry();
+  const pos = [], nor = [], uv = [], idx = [];
+  const blades = [
+    { ax: 1, az: 0, nx: 0, nz: 1 },
+    { ax: 0, az: 1, nx: 1, nz: 0 },
+  ];
+  blades.forEach((b, k) => {
+    const o = k * 4;
+    pos.push(-0.5 * b.ax, 0, -0.5 * b.az,
+              0.5 * b.ax, 0,  0.5 * b.az,
+              0.5 * b.ax, 1,  0.5 * b.az,
+             -0.5 * b.ax, 1, -0.5 * b.az);
+    for (let i = 0; i < 4; i++) nor.push(b.nx, 0.35, b.nz);
+    uv.push(0, 0, 1, 0, 1, 1, 0, 1);
+    idx.push(o, o + 1, o + 2, o, o + 2, o + 3);
+  });
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  return g;
+}
+
+// ---- layers/raptors.js ----
+
+/* ═══ COMPONENT: Raptors (the fauna) ═══
+   Birds of prey riding the updraft in the slot: they circle on held wings, bank
+   into the turn, and cross the bright ribbon of sky where they read as silhouettes.
+
+   Scale is the thing to get right — a raptor is ~2 units across at a wingspan the
+   camera sees from 20-60 units away. Too small and they read as grit on the lens;
+   too large and the canyon stops looking deep. */
+class Raptors {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr } = ctx;
+    const N = 7;
+
+    this.birds = [];
+    for (let i = 0; i < N; i++) {
+      this.birds.push({
+        cx: rr(-6, 6), cz: rr(-70, 70),          // the thermal it circles
+        r: rr(9, 22), y: rr(6, RIM - 6),
+        w: rr(0.10, 0.22) * (rr(0, 1) < 0.5 ? -1 : 1),   // angular speed + direction
+        ph: rr(0, Math.PI * 2), flap: rr(0.7, 1.5), span: rr(1.6, 2.6),
+      });
+    }
+
+    const geo = birdGeometry();
+    this.mesh = new THREE.InstancedMesh(geo, raptorMat(ctx), N);
+    this.mesh.frustumCulled = false;
+    ctx.scene.add(this.mesh);
+
+    this.m = new THREE.Matrix4(); this.q = new THREE.Quaternion();
+    this.p = new THREE.Vector3(); this.s = new THREE.Vector3();
+    this.e = new THREE.Euler();
+  }
+
+  update(dt, t) {
+    const { m, q, p, s, e } = this;
+    for (let i = 0; i < this.birds.length; i++) {
+      const b = this.birds[i];
+      const a = b.ph + t * b.w;
+      const x = b.cx + Math.cos(a) * b.r + meander(b.cz) * 0.35;
+      const z = b.cz + Math.sin(a) * b.r;
+      const y = b.y + 1.6 * Math.sin(t * 0.21 + b.ph);
+      p.set(x, y, z);
+      // face along the tangent of the circle, and bank into it
+      const heading = a + (b.w > 0 ? Math.PI / 2 : -Math.PI / 2);
+      e.set(0.12 * Math.sin(t * b.flap + b.ph), heading, b.w > 0 ? -0.42 : 0.42, 'YXZ');
+      q.setFromEuler(e);
+      s.setScalar(b.span);
+      this.mesh.setMatrixAt(i, m.compose(p, q, s));
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+/* a flat delta: body spine plus two swept wings, enough to read as a raptor
+   in silhouette against the sky, which is how it is nearly always seen. */
+function birdGeometry() {
+  const g = new THREE.BufferGeometry();
+  const pos = [
+    0, 0, -0.55, 0, 0, 0.45,             // spine
+    -0.5, 0.05, 0.12, -0.16, 0, -0.1,    // left wing
+    0.5, 0.05, 0.12, 0.16, 0, -0.1,      // right wing
+  ];
+  const idx = [0, 3, 2, 0, 2, 1, 0, 1, 4, 0, 4, 5];
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+const raptorMat = (ctx) => new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: uniformsFor(ctx.U, { uBirdC: F(new THREE.Color(0.10, 0.08, 0.07)) }),
+  vertexShader: /* glsl */`
+    varying vec3 vP, vN;
+    void main(){
+      #ifdef USE_INSTANCING
+      mat4 m = modelMatrix * instanceMatrix;
+      #else
+      mat4 m = modelMatrix;
+      #endif
+      vec4 wp = m * vec4(position, 1.0);
+      vP = wp.xyz; vN = normalize(mat3(m) * normal);
+      gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: G + /* glsl */`
+    varying vec3 vP, vN; uniform vec3 uBirdC;
+    void main(){
+      vec3 n = normalize(vN);
+      float lam = max(dot(n, -uSunDir), 0.0);
+      /* mostly silhouette: a little sun on the upper surface, sky fill from above */
+      vec3 col = uBirdC * (0.30 + 0.9 * lam) + uSkyC * uSkyI * 0.18 * (0.4 + 0.6 * max(n.y, 0.0));
+      gl_FragColor = vec4(haze(col, vP), 1.0);
+    ` + TAIL,
+});
+
+// ---- layers/dust.js ----
+
+/* ═══ COMPONENT: Dust (the effects layer) ═══
+   Airborne grit in the canyon air: fine motes that drift on uWind, catch the light
+   where the sun reaches down the slot, and thicken hugely in the dust-storm state.
+   Additive points, so they brighten the air without occluding the rock behind. */
+class Dust {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { rr } = ctx;
+    const N = 4200;
+    const p = new Float32Array(N * 3), seed = new Float32Array(N), size = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      p[i * 3] = rr(-HALF, HALF);
+      p[i * 3 + 1] = rr(-1, 40);
+      p[i * 3 + 2] = rr(-LEN / 2, LEN / 2);
+      seed[i] = rr(0, 100);
+      size[i] = rr(0.6, 2.6);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(p, 3));
+    g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+    g.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+
+    this.mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      uniforms: uniformsFor(ctx.U, { uSpan: F(LEN), uHalf: F(HALF) }),
+      vertexShader: G + /* glsl */`
+        attribute float aSeed; attribute float aSize;
+        varying float vFade; varying vec3 vP;
+        uniform float uSpan, uHalf;
+        void main(){
+          vec3 q = position;
+          /* drift downwind and settle slowly, wrapping inside the corridor */
+          vec2 w = windAt(q);
+          q.x += w.x * uTime * 1.6 + 1.2 * sin(uTime * 0.5 + aSeed);
+          q.z += w.y * uTime * 1.6 + 1.2 * cos(uTime * 0.4 + aSeed * 1.7);
+          q.y -= mod(uTime * (0.15 + 0.25 * aSize) + aSeed, 44.0) - 2.0;
+          q.x = mod(q.x + uHalf, uHalf * 2.0) - uHalf;
+          q.z = mod(q.z + uSpan * 0.5, uSpan) - uSpan * 0.5;
+          q.y = mod(q.y + 4.0, 44.0) - 4.0;
+          vP = q;
+          /* brightest where the sun reaches down the slot */
+          vFade = (0.25 + 0.75 * slotLight(q)) * (0.35 + 1.3 * uDust);
+          vec4 mv = viewMatrix * vec4(q, 1.0);
+          gl_PointSize = aSize * (170.0 / max(-mv.z, 1.0));
+          gl_Position = projectionMatrix * mv; }`,
+      fragmentShader: G + /* glsl */`
+        varying float vFade; varying vec3 vP;
+        void main(){
+          vec2 d = gl_PointCoord - 0.5;
+          float a = smoothstep(0.5, 0.0, length(d));
+          vec3 col = mix(uHazeC, uSunC, 0.55) * uSunI * vFade;
+          gl_FragColor = vec4(col * a, a * vFade * 0.5 * hazeAtt(vP));
+        ` + TAIL,
+    });
+
+    this.points = new THREE.Points(g, this.mat);
+    this.points.frustumCulled = false;
+    ctx.scene.add(this.points);
+  }
+  update() { /* motion is uTime/uWind driven in the vertex shader */ }
+}
+
+// ---- camera.js ----
+
+/* ═══ COMPONENT: Camera ═══
+   A walk down the canyon floor: the rig tracks the corridor's meander so the walls
+   stay on both sides, holds a little above the height field, and looks slightly up
+   so the bright ribbon of sky stays in frame. That ribbon is what makes the depth
+   read, so every state is judged from a viewpoint that includes it. */
+class CameraRig {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.look = new THREE.Vector3();
+  }
+  update(dt, t) {
+    const { camera } = this.ctx;
+    // drift down the corridor and wrap, so the walk never leaves the built geometry
+    const z = ((t * 3.4 + LEN / 2) % LEN) - LEN / 2;
+    const x = meander(z) + 1.6 * Math.sin(t * 0.14);
+    const ground = canyonH(x, z);
+    camera.position.set(x, ground + 1.9 + 0.12 * Math.sin(t * 1.3), z);
+
+    const zf = z - 14;
+    this.look.set(
+      meander(zf) + 1.2 * Math.sin(t * 0.09),
+      canyonH(meander(zf), zf) + 5.2 + 2.4 * Math.sin(t * 0.07),
+      zf,
+    );
+    camera.lookAt(this.look);
+    camera.rotation.z = 0.02 * Math.sin(t * 0.11);
+  }
+}
+
+// ---- postfx.js ----
+
+/* ═══ COMPONENT: PostFX ═══
+   Bloom + hand-written ACES pass (gamma + vignette); plain fallback if the
+   composer is unavailable. Contract boilerplate (SCENE_CONTRACT §11). */
+class PostFX {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const { renderer, scene, camera } = ctx;
+    try {
+      this.composer = new EffectComposer(renderer); this.composer.addPass(new RenderPass(scene, camera));
+      this.bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.4, 0.45, 0.92); this.composer.addPass(this.bloom);
+      this.out = new ShaderPass({ uniforms: { tDiffuse: { value: null }, uExposure: F(1) }, vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+        fragmentShader: `uniform sampler2D tDiffuse; uniform float uExposure; varying vec2 vUv;
+        vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+        void main(){ vec3 c = texture2D(tDiffuse, vUv).rgb * uExposure; c = aces(c); float v = 1.0 - 0.28 * pow(length(vUv - 0.5) * 1.35, 2.5);
+          gl_FragColor = vec4(pow(c * v, vec3(1.0 / 2.2)), 1.0); }` });
+      this.composer.addPass(this.out); renderer.toneMapping = THREE.NoToneMapping;
+    } catch (e) { console.warn('post-processing unavailable, plain render', e); this.composer = null; }
+  }
+  resize(w, h) { if (this.composer) { this.composer.setSize(w, h); this.bloom.setSize(w, h); } }
+  render() {
+    const { renderer, scene, camera, cur } = this.ctx;
+    if (this.composer) { this.bloom.strength = cur.bloom; this.out.uniforms.uExposure.value = cur.exposure; this.composer.render(); }
+    else { renderer.toneMappingExposure = cur.exposure; renderer.render(scene, camera); }
+  }
+}
+
+// ---- scene.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE: Canyon — a slot canyon in a desert mesa under hard light.
+   Enumerated manifest: four named states, chosen to move the LIGHTING MODEL
+   and not merely the palette — direct sun down the slot, bounce off the walls,
+   dust scattering, and a night with no sun at all.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const STATES = {
+  'dawn-rim': {
+    caption: 'First sun catches only the rim; the floor is still holding last night’s blue, and the walls glow from the top down.',
+    hazeC: [0.44, 0.38, 0.40], hazeD: 0.0075, skyC: [0.42, 0.52, 0.78], skyI: 0.85,
+    sunC: [1.0, 0.62, 0.34], sunI: 0.9, sunEl: 0.13, sunAz: 0.95,
+    bounceC: [0.85, 0.45, 0.26], bounceI: 0.22, dust: 0.12, shimmer: 0.0, strata: 0.85,
+    rockC: [0.60, 0.33, 0.22], windX: 0.10, windZ: 0.04, scrubDry: 0.35, birdSpeed: 0.6,
+    moon: 0.15, stars: 0.18, bloom: 0.28, exposure: 1.0 },
+  'high-noon': {
+    caption: 'The sun stands in the slot. Light goes straight to the floor, the walls throw it back at each other, and everything is edge and glare.',
+    hazeC: [0.72, 0.62, 0.52], hazeD: 0.0055, skyC: [0.30, 0.52, 0.92], skyI: 1.35,
+    sunC: [1.0, 0.97, 0.90], sunI: 2.0, sunEl: 1.32, sunAz: 0.2,
+    bounceC: [0.95, 0.55, 0.32], bounceI: 0.75, dust: 0.18, shimmer: 0.8, strata: 1.0,
+    rockC: [0.68, 0.38, 0.25], windX: 0.18, windZ: 0.05, scrubDry: 0.55, birdSpeed: 1.0,
+    moon: 0.0, stars: 0.0, bloom: 0.34, exposure: 0.92 },
+  'dust-storm': {
+    caption: 'Wind funnels down the corridor and fills it with ochre; the far wall goes to a rumour and the sun to a coin.',
+    hazeC: [0.66, 0.45, 0.26], hazeD: 0.019, skyC: [0.62, 0.48, 0.30], skyI: 0.75,
+    sunC: [0.95, 0.66, 0.36], sunI: 0.85, sunEl: 0.85, sunAz: -0.5,
+    bounceC: [0.72, 0.42, 0.24], bounceI: 0.30, dust: 1.0, shimmer: 0.25, strata: 0.5,
+    rockC: [0.58, 0.35, 0.24], windX: 0.85, windZ: 0.35, scrubDry: 0.8, birdSpeed: 0.35,
+    moon: 0.0, stars: 0.0, bloom: 0.18, exposure: 1.05 },
+  'night-cold': {
+    caption: 'No sun at all. The rock gives back the day’s heat to a sky full of stars, and the canyon reads in silhouette.',
+    hazeC: [0.05, 0.07, 0.12], hazeD: 0.010, skyC: [0.10, 0.16, 0.34], skyI: 0.42,
+    sunC: [0.40, 0.52, 0.85], sunI: 0.10, sunEl: -0.35, sunAz: 2.1,
+    bounceC: [0.18, 0.22, 0.38], bounceI: 0.10, dust: 0.08, shimmer: 0.0, strata: 0.6,
+    rockC: [0.40, 0.28, 0.24], windX: 0.06, windZ: 0.02, scrubDry: 0.45, birdSpeed: 0.2,
+    moon: 1.0, stars: 1.0, bloom: 0.55, exposure: 1.08 },
+};
+const ORDER = Object.keys(STATES);
+const isColor = (k) => Array.isArray(STATES[ORDER[0]][k]);
+
+const sceneDef = {
+  meta: { fov: 62, near: 0.1, far: 700, pixelRatio: 1.5, rate: 1.1, seed: 7, toneMapping: 'ACESFilmicToneMapping' },
+
+  buildUniforms() {
+    return {
+      uTime: F(0),
+      uHazeC: C3(), uHazeD: F(0.008),
+      uSkyC: C3(), uSkyI: F(1),
+      uSunDir: V3(0, -1, 0), uSunC: C3(), uSunI: F(1),
+      uBounceC: C3(), uBounceI: F(0.4),
+      uDust: F(0.2), uShimmer: F(0), uStrata: F(1), uMoon: F(0), uStars: F(0),
+      uRockC: C3(), uDry: F(0.5), uRimY: F(RIM),
+      uWind: { value: new THREE.Vector2(0.15, 0.05) },
+    };
+  },
+
+  initialState() { const h = location.hash.slice(1); return STATES[h] ? h : ORDER[0]; },
+
+  resolveState(name) {
+    const s = STATES[STATES[name] ? name : ORDER[0]];
+    const t = {};
+    for (const k in s) { if (k === 'caption') continue; t[k] = isColor(k) ? new THREE.Color(...s[k]) : s[k]; }
+    return t;
+  },
+
+  applyToUniforms(cur, ctx) {
+    const U = ctx.U;
+    U.uHazeC.value.copy(cur.hazeC); U.uHazeD.value = cur.hazeD;
+    U.uSkyC.value.copy(cur.skyC); U.uSkyI.value = cur.skyI;
+    U.uSunC.value.copy(cur.sunC); U.uSunI.value = cur.sunI;
+    U.uBounceC.value.copy(cur.bounceC); U.uBounceI.value = cur.bounceI;
+    U.uDust.value = cur.dust; U.uShimmer.value = cur.shimmer; U.uStrata.value = cur.strata;
+    U.uMoon.value = cur.moon; U.uStars.value = cur.stars;
+    U.uRockC.value.copy(cur.rockC); U.uDry.value = cur.scrubDry;
+    U.uWind.value.set(cur.windX, cur.windZ);
+    // sun direction from elevation/azimuth: this is the vector layers shade against
+    const ce = Math.cos(cur.sunEl);
+    U.uSunDir.value.set(-ce * Math.sin(cur.sunAz), -Math.sin(cur.sunEl), -ce * Math.cos(cur.sunAz)).normalize();
+  },
+
+  setup(ctx) { ctx.scene.background = ctx.U.uHazeC.value; },
+
+  layers: [Walls, Firmament, Scrub, Raptors, Dust],
+  camera: CameraRig,
+  postfx: PostFX,
+
+  onHashChange(sm) { const name = STATES[location.hash.slice(1)] ? location.hash.slice(1) : ORDER[0]; sm.setState(name); showState(name); },
+
+  setupUI(ctx, sm) {
+    captionEl = document.getElementById('caption'); nav = document.getElementById('nav');
+    ORDER.forEach((n) => { const b = document.createElement('button'); b.textContent = n; b.dataset.state = n; b.addEventListener('click', () => { location.hash = n; }); nav.appendChild(b); });
+    showState(sceneDef.initialState(), true);
+  },
+};
+
+// ---- caption + nav (module-scoped, wired in setupUI) ----
+let captionEl, nav;
+function showState(name, instant = false) {
+  nav.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.state === name));
+  captionEl.classList.add('fade');
+  setTimeout(() => { captionEl.textContent = STATES[name].caption; captionEl.classList.remove('fade'); }, instant ? 0 : 500);
+}
+
+boot(document.getElementById('scene'), sceneDef);
+
+</script>
+</body>
+</html>

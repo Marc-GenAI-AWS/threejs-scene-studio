@@ -1,0 +1,1153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sea State — ocean simulator</title>
+<!-- machine-readable state list: harnesses drive the sim via location.hash -->
+<meta name="states" content="dawn-clear,midday-clear,dusk-clear,night-clear,dawn-cloudy,midday-cloudy,dusk-cloudy,night-cloudy,dawn-fog,midday-fog,dusk-fog,night-fog,dawn-rain,midday-rain,dusk-rain,night-rain,dawn-storm,midday-storm,dusk-storm,night-storm" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@1,6..72,400;1,6..72,500&display=swap"
+  rel="stylesheet"
+/>
+<style>
+  :root {
+    --ink: #ecf3f6;
+    --ink-dim: rgba(236, 243, 246, 0.45);
+    --ink-mid: rgba(236, 243, 246, 0.75);
+    --hairline: rgba(236, 243, 246, 0.16);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: #000; }
+  canvas#scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  #ui {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; justify-content: space-between;
+    pointer-events: none;
+    color: var(--ink);
+    font-family: "IBM Plex Mono", monospace;
+    transition: opacity 0.5s ease;
+  }
+  #ui.hidden { opacity: 0; }
+  #ui.hidden * { pointer-events: none !important; }
+
+  /* legibility scrims — no cards, just breath at the edges */
+  #ui::before, #ui::after {
+    content: ""; position: absolute; left: 0; right: 0; pointer-events: none;
+  }
+  #ui::before { top: 0; height: 160px; background: linear-gradient(rgba(2, 6, 10, 0.28), transparent); }
+  #ui::after { bottom: 0; height: 240px; background: linear-gradient(transparent, rgba(2, 6, 10, 0.5)); z-index: -1; }
+
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 22px 28px;
+  }
+  .mark {
+    font-size: 12px; font-weight: 500; letter-spacing: 0.34em;
+    text-shadow: 0 1px 8px rgba(0, 0, 0, 0.4);
+  }
+  .mark small { letter-spacing: 0.2em; font-weight: 400; color: var(--ink-dim); margin-left: 1.2em; font-size: 10px; }
+  .hint { font-size: 10px; letter-spacing: 0.12em; color: var(--ink-dim); text-shadow: 0 1px 6px rgba(0, 0, 0, 0.5); }
+
+  footer { padding: 0 28px 26px; max-width: 720px; }
+
+  #forecast {
+    font-family: "Newsreader", serif;
+    font-style: italic;
+    font-weight: 400;
+    font-size: clamp(21px, 3vw, 31px);
+    line-height: 1.3;
+    max-width: 24ch;
+    margin-bottom: 22px;
+    text-shadow: 0 1px 14px rgba(0, 0, 0, 0.45);
+    transition: opacity 0.45s ease;
+  }
+  #forecast.fading { opacity: 0; }
+
+  .row {
+    display: flex; align-items: baseline; gap: 4px;
+    padding: 9px 0;
+    border-top: 1px solid var(--hairline);
+    pointer-events: auto;
+  }
+  .row .label {
+    font-size: 10px; letter-spacing: 0.22em; color: var(--ink-dim);
+    width: 88px; flex: none;
+  }
+  .row button {
+    appearance: none; background: none; border: none; cursor: pointer;
+    font: 500 11px/1 "IBM Plex Mono", monospace;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-dim);
+    padding: 6px 10px;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
+    transition: color 0.25s ease;
+    border-radius: 2px;
+  }
+  .row button:hover { color: var(--ink-mid); }
+  .row button[aria-pressed="true"] {
+    color: var(--ink);
+    text-decoration: underline;
+    text-underline-offset: 6px;
+    text-decoration-thickness: 1px;
+  }
+  .row button:focus-visible { outline: 1px solid var(--ink-mid); outline-offset: 2px; }
+
+  @media (max-width: 640px) {
+    header, footer { padding-left: 16px; padding-right: 16px; }
+    .hint { display: none; }
+    .row { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+
+<div id="ui">
+  <header>
+    <span class="mark">SEA STATE<small>ocean simulator</small></span>
+    <span class="hint">1–4 time · Q–T weather · H hide</span>
+  </header>
+  <footer>
+    <p id="forecast" aria-live="polite"></p>
+    <div class="row" role="group" aria-label="Time of day">
+      <span class="label">TIME</span>
+      <button data-time="dawn">Dawn</button>
+      <button data-time="midday">Midday</button>
+      <button data-time="dusk">Dusk</button>
+      <button data-time="night">Night</button>
+    </div>
+    <div class="row" role="group" aria-label="Weather">
+      <span class="label">WEATHER</span>
+      <button data-weather="clear">Clear</button>
+      <button data-weather="cloudy">Cloudy</button>
+      <button data-weather="fog">Fog</button>
+      <button data-weather="rain">Rain</button>
+      <button data-weather="storm">Storm</button>
+    </div>
+  </footer>
+</div>
+
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ---- ../contract/runtime.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE CONTRACT — shared runtime (v1)
+   The scene-agnostic engine every scene boots against. See SCENE_CONTRACT.md.
+   Provides: uniform helpers, a seeded RNG, a state machine (enumerated OR
+   factored manifest), and the assembler loop. A scene supplies a `sceneDef`
+   (uniforms, layer classes, camera, state resolver, per-frame apply) to boot().
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* uniform helpers — a ShaderMaterial's uniforms is uniformsFor({...locals}) */
+const F  = (v) => ({ value: v });
+const C3 = () => ({ value: new THREE.Color() });
+const V3 = (x = 0, y = 0, z = 0) => ({ value: new THREE.Vector3(x, y, z) });
+const uniformsFor = (U, extra = {}) => ({ ...U, ...extra });
+
+/* deterministic RNG (park–miller); no Math.random in scene code */
+function makeRNG(seed = 7) {
+  let s = (seed >>> 0) || 1;
+  const rnd = () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
+  const rr = (a, b) => a + (b - a) * rnd();
+  return { rnd, rr };
+}
+
+/* cur → target exponential interpolation of every visual parameter.
+   `resolve(name)` returns a fresh target object (numbers, THREE.Color, THREE.Vector3).
+   Colors/Vectors lerp via .lerp; numbers lerp arithmetically. */
+class StateMachine {
+  constructor({ initial, resolve, rate = 1.2, onApply }) {
+    this.resolve = resolve; this.rate = rate; this.onApply = onApply;
+    this.cur = {}; this.target = {};
+    this.setState(initial, true);
+  }
+  setState(name, instant = false) {
+    const t = this.resolve(name);
+    for (const k in t) if (!(k in this.cur)) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+    this.target = t;
+    if (instant) for (const k in t) { const v = t[k]; this.cur[k] = (v && v.clone) ? v.clone() : v; }
+  }
+  tick(dt, t, ctx) {
+    const k = 1 - Math.exp(-dt * this.rate), cur = this.cur, tg = this.target;
+    for (const key in tg) {
+      const c = cur[key], target = tg[key];
+      if (typeof c === 'number') cur[key] = c + (target - c) * k;
+      else if (c && c.lerp) c.lerp(target, k);
+    }
+    if (this.onApply) this.onApply(cur, ctx, t);
+  }
+}
+
+/* boot the frozen skeleton: renderer, scene, camera, layers[], main loop.
+   sceneDef: { meta, buildUniforms(), resolveState(name), initialState(),
+               applyToUniforms(cur,ctx,t), layers:[Class], camera:Class,
+               postfx?:Class, setupUI?(ctx,sm), onHashChange?(sm) } */
+function boot(canvas, sceneDef) {
+  const meta = sceneDef.meta || {};
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, meta.pixelRatio ?? 2));
+  renderer.setSize(innerWidth, innerHeight);
+  if (meta.toneMapping && THREE[meta.toneMapping]) renderer.toneMapping = THREE[meta.toneMapping];
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(meta.fov ?? 55, innerWidth / innerHeight, meta.near ?? 0.5, meta.far ?? 10000);
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const { rnd, rr } = makeRNG(meta.seed ?? 7);
+  const U = sceneDef.buildUniforms();
+  const ctx = { THREE, renderer, scene, camera, U, rnd, rr, reducedMotion, cur: null };
+
+  const sm = new StateMachine({
+    initial: sceneDef.initialState(),
+    resolve: (name) => sceneDef.resolveState(name),
+    rate: meta.rate ?? 1.2,
+    onApply: (cur, c, t) => sceneDef.applyToUniforms(cur, c, t),
+  });
+  ctx.cur = sm.cur;
+
+  // scene-level setup (background, renderer tweaks) before layers are built
+  if (sceneDef.setup) sceneDef.setup(ctx);
+
+  const layers = (sceneDef.layers || []).map((L) => new L(ctx));
+  const rig = sceneDef.camera ? new sceneDef.camera(ctx) : null;
+  const post = sceneDef.postfx ? new sceneDef.postfx(ctx) : null;
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); if (post && post.resize) post.resize(innerWidth, innerHeight);
+  });
+  addEventListener('hashchange', () => sceneDef.onHashChange ? sceneDef.onHashChange(sm) : sm.setState(location.hash.slice(1)));
+  if (sceneDef.setupUI) sceneDef.setupUI(ctx, sm);
+
+  const clock = new THREE.Clock(); let t = 0;
+  function frame() {
+    const dt = Math.min(clock.getDelta(), 0.05); t += dt;
+    U.uTime.value = t;
+    sm.tick(dt, t, ctx);
+    if (rig) rig.update(dt, t, ctx);
+    for (const l of layers) if (l.update) l.update(dt, t);
+    if (post) post.render(); else renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  frame();
+  return { ctx, sm, layers, rig, post };
+}
+
+// ---- prelude.glsl.js ----
+
+// Scene FIELDS (seastate): one skyRadiance() used by BOTH the sky dome and the
+// ocean's reflections/fog, so the water always mirrors the exact sky above it.
+// Materials must define CLOUD_OCT (fbm octaves) before including this chunk.
+
+const atmosphereUniformsGLSL = /* glsl */ `
+uniform vec3  uSunDir;
+uniform vec3  uSunTint;
+uniform vec3  uZenith;
+uniform vec3  uHorizon;
+uniform float uGradFalloff;
+uniform float uSunDisc;
+uniform float uSunGlow;
+uniform float uCloudCoverage;
+uniform float uCloudDensity;
+uniform float uCloudScale;
+uniform vec2  uCloudOff;
+uniform vec3  uCloudLit;
+uniform vec3  uCloudShadow;
+uniform vec3  uFogColor;
+uniform float uFogVeil;
+uniform float uStars;
+uniform vec3  uMoonDir;
+uniform float uMoon;
+uniform float uLightning;
+uniform float uTime;
+uniform float uExposure;
+`;
+
+const atmosphereGLSL = /* glsl */ `
+float hash21(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+  float v = 0.0;
+  float a = 0.5;
+  mat2 r = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < CLOUD_OCT; i++) {
+    v += a * vnoise(p);
+    p = r * p * 2.03;
+    a *= 0.5;
+  }
+  return v;
+}
+
+vec4 cloudLayer(vec3 dir) {
+  float horizonFade = smoothstep(0.015, 0.14, dir.y);
+  if (horizonFade <= 0.001 || uCloudCoverage <= 0.004) return vec4(0.0);
+
+  // project the view ray onto a virtual cloud deck
+  vec2 uv = dir.xz * (1.0 / max(dir.y, 0.06)) * uCloudScale + uCloudOff;
+  float base = fbm(uv);
+
+  float cov  = uCloudCoverage;
+  float mask  = smoothstep(1.0 - cov - 0.12, 1.0 - cov + 0.30, base);
+  float thick = smoothstep(1.0 - cov, 1.0 - cov + 0.55, base);
+
+  // cheap directional lighting: sample density toward the sun
+  vec2 toSun = normalize(uSunDir.xz + vec2(0.0001, 0.0)) * 0.4;
+  float baseS = fbm(uv + toSun);
+  float rim = clamp((base - baseS) * 3.0 + 0.5, 0.0, 1.0);
+
+  vec3 col = mix(uCloudLit, uCloudShadow, clamp(thick * uCloudDensity, 0.0, 1.0));
+  col = mix(col, uCloudLit, rim * 0.35 * (1.0 - thick * 0.5));
+  col += vec3(0.85, 0.9, 1.0) * uLightning * 0.9;
+
+  float alpha = mask * horizonFade * clamp(uCloudDensity + 0.35, 0.0, 1.0);
+  return vec4(col, clamp(alpha, 0.0, 1.0));
+}
+
+vec3 starField(vec3 dir) {
+  if (uStars <= 0.003 || dir.y <= 0.0) return vec3(0.0);
+  vec2 sp = vec2(atan(dir.x, dir.z), dir.y) * vec2(60.0, 90.0);
+  vec2 cell = floor(sp);
+  vec2 f = fract(sp);
+  float h = hash21(cell);
+  if (h < 0.78) return vec3(0.0);
+  vec2 starPos = vec2(hash21(cell + 7.1), hash21(cell + 3.7));
+  float d = length(f - starPos);
+  float b = smoothstep(0.09, 0.0, d);
+  float mag = (h - 0.78) / 0.22;
+  float tw = 0.7 + 0.3 * sin(uTime * (1.5 + 4.0 * mag) + h * 40.0);
+  return vec3(0.9, 0.93, 1.0) * b * mag * tw * smoothstep(0.0, 0.18, dir.y);
+}
+
+vec3 skyRadiance(vec3 dir) {
+  float y = clamp(dir.y, 0.0, 1.0);
+  vec3 col = mix(uHorizon, uZenith, pow(y, uGradFalloff));
+
+  // sun glow + halo + disc
+  float sd = max(dot(dir, uSunDir), 0.0);
+  col += uSunTint * (pow(sd, 6.0) * 0.35 + pow(sd, 32.0) * 0.5) * uSunGlow;
+  col += uSunTint * smoothstep(0.99930, 0.99975, sd) * uSunDisc * 1.6;
+
+  // night sky — the sharp stars/moon disc only exist in the sky dome itself;
+  // in water reflections they alias into per-pixel speckle, so skip them there
+  float md = max(dot(dir, uMoonDir), 0.0);
+  vec3 moonCol = vec3(0.92, 0.95, 1.0);
+#ifdef SKY_FULL
+  col += starField(dir) * uStars;
+  col += moonCol * smoothstep(0.99985, 0.99994, md) * uMoon * 2.5;
+#endif
+  col += moonCol * pow(md, 150.0) * uMoon * 0.35;
+
+  // clouds occlude everything above
+  vec4 cl = cloudLayer(dir);
+  col = mix(col, cl.rgb, cl.a);
+
+  // lightning ambience
+  col += vec3(0.75, 0.8, 1.0) * uLightning * 0.35;
+
+  // haze / fog veil, densest at the horizon
+  float veil = uFogVeil * mix(1.0, exp(-max(dir.y, 0.0) * 5.0), 0.75);
+  col = mix(col, uFogColor, clamp(veil, 0.0, 1.0));
+
+  return col;
+}
+
+vec3 acesTonemap(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+`;
+
+// ---- presets.js ----
+
+// The factored state manifest: a time-of-day preset combined with a weather
+// preset produces one flat target object (colours, vectors, numbers) that the
+// contract StateMachine interpolates. See SCENE_CONTRACT.md §8 (factored form).
+
+// ---------- time of day: sun position and palette ----------
+
+const TIMES = {
+  dawn: {
+    label: 'Dawn',
+    sunEl: 6, sunAz: -20,
+    sunTint: [1.0, 0.62, 0.36],
+    zenith: [0.13, 0.21, 0.4],
+    horizon: [0.9, 0.5, 0.3],
+    falloff: 0.34,
+    glow: 0.85, disc: 1.0,
+    cloudLit: [1.0, 0.72, 0.52],
+    cloudShadow: [0.28, 0.28, 0.38],
+    stars: 0.12, moon: 0.0,
+    waterDeep: [0.02, 0.05, 0.09],
+    waterShallow: [0.1, 0.17, 0.19],
+    exposure: 1.0,
+  },
+  midday: {
+    label: 'Midday',
+    sunEl: 62, sunAz: 15,
+    sunTint: [1.0, 0.98, 0.92],
+    zenith: [0.09, 0.32, 0.72],
+    horizon: [0.55, 0.72, 0.88],
+    falloff: 0.36,
+    glow: 0.5, disc: 1.0,
+    cloudLit: [1.0, 1.0, 1.0],
+    cloudShadow: [0.55, 0.6, 0.68],
+    stars: 0.0, moon: 0.0,
+    waterDeep: [0.015, 0.08, 0.14],
+    waterShallow: [0.05, 0.28, 0.3],
+    exposure: 1.0,
+  },
+  dusk: {
+    label: 'Dusk',
+    sunEl: 3.5, sunAz: 18,
+    sunTint: [1.0, 0.42, 0.18],
+    zenith: [0.16, 0.1, 0.26],
+    horizon: [0.95, 0.4, 0.16],
+    falloff: 0.34,
+    glow: 1.1, disc: 1.0,
+    cloudLit: [1.0, 0.5, 0.3],
+    cloudShadow: [0.32, 0.22, 0.32],
+    stars: 0.18, moon: 0.0,
+    waterDeep: [0.02, 0.045, 0.08],
+    waterShallow: [0.11, 0.12, 0.14],
+    exposure: 1.0,
+  },
+  night: {
+    label: 'Night',
+    sunEl: -14, sunAz: 0,
+    sunTint: [0.05, 0.07, 0.12],
+    zenith: [0.008, 0.012, 0.03],
+    horizon: [0.045, 0.06, 0.1],
+    falloff: 0.6,
+    glow: 0.0, disc: 0.0,
+    cloudLit: [0.1, 0.12, 0.18],
+    cloudShadow: [0.02, 0.025, 0.04],
+    stars: 1.0, moon: 0.9,
+    waterDeep: [0.004, 0.008, 0.014],
+    waterShallow: [0.02, 0.05, 0.07],
+    exposure: 1.3,
+  },
+};
+
+// ---------- weather: sea + cloud + visibility character ----------
+
+const WEATHERS = {
+  clear: {
+    label: 'Clear',
+    coverage: 0.08, cloudDensity: 0.55, cloudScale: 1.1, cloudDrift: 0.004,
+    desat: 0.0, darken: 1.0, cloudDark: 1.0,
+    disc: 1.0, glow: 1.0, stars: 1.0, moon: 1.0,
+    fogDensity: 0.0013, veil: 0.05,
+    amp: 0.35, chop: 0.7, speed: 1.0,
+    foam: 0.15, detail: 0.18, specPower: 720, spec: 1.0,
+    rain: 0.0, storminess: 0.0,
+  },
+  cloudy: {
+    label: 'Cloudy',
+    coverage: 0.48, cloudDensity: 0.8, cloudScale: 1.2, cloudDrift: 0.01,
+    desat: 0.25, darken: 0.9, cloudDark: 0.85,
+    disc: 0.55, glow: 0.7, stars: 0.55, moon: 0.8,
+    fogDensity: 0.0016, veil: 0.12,
+    amp: 0.7, chop: 0.95, speed: 1.0,
+    foam: 0.45, detail: 0.3, specPower: 380, spec: 0.8,
+    rain: 0.0, storminess: 0.0,
+  },
+  fog: {
+    label: 'Fog',
+    coverage: 0.8, cloudDensity: 0.5, cloudScale: 1.4, cloudDrift: 0.006,
+    desat: 0.55, darken: 0.92, cloudDark: 1.0,
+    disc: 0.0, glow: 0.25, stars: 0.12, moon: 0.3,
+    fogDensity: 0.012, veil: 0.85,
+    amp: 0.26, chop: 0.6, speed: 0.9,
+    foam: 0.1, detail: 0.14, specPower: 500, spec: 0.3,
+    rain: 0.0, storminess: 0.0,
+  },
+  rain: {
+    label: 'Rain',
+    coverage: 0.85, cloudDensity: 0.95, cloudScale: 1.25, cloudDrift: 0.018,
+    desat: 0.5, darken: 0.78, cloudDark: 0.85,
+    disc: 0.0, glow: 0.35, stars: 0.1, moon: 0.35,
+    fogDensity: 0.0028, veil: 0.3,
+    amp: 0.85, chop: 1.1, speed: 1.05,
+    foam: 0.6, detail: 0.42, specPower: 200, spec: 0.4,
+    rain: 0.8, storminess: 0.25,
+  },
+  storm: {
+    label: 'Storm',
+    coverage: 0.98, cloudDensity: 1.15, cloudScale: 1.15, cloudDrift: 0.032,
+    desat: 0.6, darken: 0.5, cloudDark: 0.5,
+    disc: 0.0, glow: 0.2, stars: 0.0, moon: 0.15,
+    fogDensity: 0.0032, veil: 0.32,
+    amp: 1.55, chop: 1.25, speed: 1.15,
+    foam: 1.0, detail: 0.55, specPower: 140, spec: 0.3,
+    rain: 1.0, storminess: 1.0,
+  },
+};
+
+// ---------- helpers ----------
+
+function dirFrom(elevDeg, azDeg) {
+  const el = THREE.MathUtils.degToRad(elevDeg);
+  const az = THREE.MathUtils.degToRad(azDeg);
+  return new THREE.Vector3(
+    Math.sin(az) * Math.cos(el),
+    Math.sin(el),
+    -Math.cos(az) * Math.cos(el)
+  );
+}
+
+function gloom(rgb, desat, darken) {
+  const c = new THREE.Color(rgb[0], rgb[1], rgb[2]);
+  const lum = c.r * 0.299 + c.g * 0.587 + c.b * 0.114;
+  c.lerp(new THREE.Color(lum, lum, lum), desat);
+  c.multiplyScalar(darken);
+  return c;
+}
+
+// ---------- combine a time preset with a weather preset ----------
+
+function computeTarget(timeKey, wxKey) {
+  const T = TIMES[timeKey];
+  const W = WEATHERS[wxKey];
+
+  const horizon = gloom(T.horizon, W.desat, W.darken);
+  const lumGray = (() => {
+    const l = horizon.r * 0.299 + horizon.g * 0.587 + horizon.b * 0.114;
+    return new THREE.Color(l, l, l);
+  })();
+
+  return {
+    sunDir: dirFrom(T.sunEl, T.sunAz),
+    sunTint: gloom(T.sunTint, W.desat * 0.5, W.darken),
+    zenith: gloom(T.zenith, W.desat, W.darken),
+    horizon,
+    gradFalloff: T.falloff,
+    sunDisc: T.disc * W.disc,
+    sunGlow: T.glow * W.glow,
+    cloudCoverage: W.coverage,
+    cloudDensity: W.cloudDensity,
+    cloudScale: W.cloudScale,
+    cloudDrift: W.cloudDrift,
+    cloudLit: gloom(T.cloudLit, W.desat * 0.6, W.darken * W.cloudDark),
+    cloudShadow: gloom(T.cloudShadow, W.desat * 0.4, W.cloudDark),
+    fogColor: horizon.clone().lerp(lumGray, 0.5),
+    fogVeil: W.veil,
+    stars: T.stars * W.stars,
+    moonDir: dirFrom(12, -26),
+    moon: T.moon * W.moon,
+    waterDeep: gloom(T.waterDeep, W.desat * 0.7, W.darken),
+    waterShallow: gloom(T.waterShallow, W.desat * 0.7, W.darken),
+    ampMul: W.amp,
+    chopMul: W.chop,
+    speedMul: W.speed,
+    foamAmount: W.foam,
+    detail: W.detail,
+    specPower: W.specPower,
+    spec: W.spec,
+    fogDensity: W.fogDensity,
+    rain: W.rain,
+    storminess: W.storminess,
+    exposure: T.exposure,
+  };
+}
+
+// ---------- the forecast line ----------
+
+const FORECAST = {
+  clear:  { sky: 'clear skies',     wind: 'light airs',      sea: 'sea slight',    vis: 'excellent' },
+  cloudy: { sky: 'scattered cloud', wind: 'moderate breeze', sea: 'sea moderate',  vis: 'good' },
+  fog:    { sky: 'fog banks',       wind: 'near calm',       sea: 'sea smooth',    vis: 'less than one mile' },
+  rain:   { sky: 'steady rain',     wind: 'fresh breeze',    sea: 'sea rough',     vis: 'moderate' },
+  storm:  { sky: 'storm force ten', wind: 'violent squalls', sea: 'sea very high', vis: 'very poor' },
+};
+
+function forecastLine(timeKey, wxKey) {
+  const f = FORECAST[wxKey];
+  const t = TIMES[timeKey].label;
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  return `${t} — ${f.sky}. ${cap(f.wind)}, ${f.sea}. Visibility ${f.vis}.`;
+}
+
+const TIME_KEYS = Object.keys(TIMES);
+const WEATHER_KEYS = Object.keys(WEATHERS);
+
+// ---- layers/sky.js ----
+
+/* ═══ COMPONENT: Sky ═══
+   The sky dome. Owns the cloud-deck drift; reads the shared palette (U) that
+   applyToUniforms publishes. skyRadiance() is shared with the ocean so the
+   water mirrors the exact sky above it. */
+class Sky {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const geo = new THREE.SphereGeometry(4200, 64, 32);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      defines: { CLOUD_OCT: 5, SKY_FULL: 1 },
+      uniforms: ctx.U,
+      vertexShader: /* glsl */ `
+        varying vec3 vWorldPos;
+        void main() {
+          vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader:
+        atmosphereUniformsGLSL +
+        atmosphereGLSL +
+        /* glsl */ `
+        varying vec3 vWorldPos;
+        void main() {
+          vec3 dir = normalize(vWorldPos - cameraPosition);
+          vec3 col = skyRadiance(dir);
+          col = acesTonemap(col * uExposure);
+          col = pow(col, vec3(0.4545));
+          col += (hash21(gl_FragCoord.xy) - 0.5) / 255.0; // dither: kills gradient banding
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    ctx.scene.add(mesh);
+  }
+  update(dt) {
+    const cur = this.ctx.cur, off = this.ctx.U.uCloudOff.value;
+    off.x += 0.62 * cur.cloudDrift * dt * 60;
+    off.y += 0.35 * cur.cloudDrift * dt * 60;
+  }
+}
+
+// ---- layers/ocean.js ----
+
+// Grid warped so vertex density concentrates near the camera: fine detail up
+// close, long cheap triangles out at the horizon.
+function makeOceanGeometry(N, half, expo) {
+  const verts = (N + 1) * (N + 1);
+  const positions = new Float32Array(verts * 3);
+  let ptr = 0;
+  for (let iz = 0; iz <= N; iz++) {
+    const uz = (iz / N) * 2 - 1;
+    const z = Math.sign(uz) * Math.pow(Math.abs(uz), expo) * half;
+    for (let ix = 0; ix <= N; ix++) {
+      const ux = (ix / N) * 2 - 1;
+      const x = Math.sign(ux) * Math.pow(Math.abs(ux), expo) * half;
+      positions[ptr++] = x;
+      positions[ptr++] = 0;
+      positions[ptr++] = z;
+    }
+  }
+  const index = new Uint32Array(N * N * 6);
+  ptr = 0;
+  for (let iz = 0; iz < N; iz++) {
+    for (let ix = 0; ix < N; ix++) {
+      const a = iz * (N + 1) + ix;
+      const b = a + 1;
+      const c = a + (N + 1);
+      const d = c + 1;
+      index[ptr++] = a; index[ptr++] = c; index[ptr++] = b;
+      index[ptr++] = b; index[ptr++] = c; index[ptr++] = d;
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setIndex(new THREE.BufferAttribute(index, 1));
+  return geo;
+}
+
+/* ═══ COMPONENT: Ocean (ground/water) ═══
+   Gerstner-wave water surface. Reads the shared palette + sea knobs from cur;
+   owns its wave-time clock and its water material uniforms. */
+class Ocean {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.waveTime = 0;
+    const geo = makeOceanGeometry(320, 2600, 1.7);
+
+    const mat = new THREE.ShaderMaterial({
+      defines: { CLOUD_OCT: 3 },
+      uniforms: uniformsFor(ctx.U, {
+        uWaveTime: { value: 0 },
+        uAmpMul: { value: 0.4 },
+        uChopMul: { value: 0.8 },
+        uWaterDeep: { value: new THREE.Color(0.015, 0.08, 0.14) },
+        uWaterShallow: { value: new THREE.Color(0.05, 0.28, 0.3) },
+        uFoamAmount: { value: 0.2 },
+        uDetail: { value: 0.25 },
+        uSpecPower: { value: 700 },
+        uSpec: { value: 1.0 },
+        uFogDensity: { value: 0.0013 },
+      }),
+      vertexShader: /* glsl */ `
+        uniform float uWaveTime;
+        uniform float uAmpMul;
+        uniform float uChopMul;
+
+        varying vec3 vWorldPos;
+        varying vec3 vNormal;
+        varying float vFoam;
+        varying float vHeight;
+
+        vec3 waveAdd(vec2 p, vec2 dir, float L, float amp, float t) {
+          float k = 6.2831853 / L;
+          float c = sqrt(9.81 / k);
+          vec2 D = normalize(dir);
+          float f = k * (dot(D, p) - c * t);
+          float A = amp * uAmpMul;
+          float s = sin(f);
+          float co = cos(f);
+          return vec3(D.x * uChopMul * A * co, A * s, D.y * uChopMul * A * co);
+        }
+
+        vec3 displace(vec2 p, float t) {
+          vec3 d = vec3(0.0);
+          d += waveAdd(p, vec2(1.0,  0.12), 101.0, 0.55,  t);
+          d += waveAdd(p, vec2(1.0, -0.06),  63.0, 0.80,  t);
+          d += waveAdd(p, vec2(0.94, -0.34), 31.0, 0.42,  t);
+          d += waveAdd(p, vec2(0.83,  0.55), 17.0, 0.25,  t);
+          d += waveAdd(p, vec2(0.70, -0.72),  8.9, 0.14,  t);
+          d += waveAdd(p, vec2(0.96,  0.28),  4.7, 0.065, t);
+          return d;
+        }
+
+        void main() {
+          vec2 p = position.xz;
+          float t = uWaveTime;
+
+          vec3 dp = displace(p, t);
+          vec3 wp = vec3(p.x, 0.0, p.y) + dp;
+
+          float e = 1.2;
+          vec3 px = vec3(p.x + e, 0.0, p.y) + displace(p + vec2(e, 0.0), t);
+          vec3 pz = vec3(p.x, 0.0, p.y + e) + displace(p + vec2(0.0, e), t);
+          vec3 tx = px - wp;
+          vec3 tz = pz - wp;
+          vNormal = normalize(cross(tz, tx));
+
+          // horizontal squeeze at crests -> whitecaps
+          float J = (tx.x * tz.z - tx.z * tz.x) / (e * e);
+          float crest = clamp(1.0 - J, 0.0, 1.0);
+          vFoam = crest * 1.4 + max(dp.y, 0.0) * 0.12;
+
+          vHeight = dp.y;
+          vWorldPos = wp;
+          gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+        }
+      `,
+      fragmentShader:
+        atmosphereUniformsGLSL +
+        /* glsl */ `
+        uniform vec3  uWaterDeep;
+        uniform vec3  uWaterShallow;
+        uniform float uFoamAmount;
+        uniform float uDetail;
+        uniform float uSpecPower;
+        uniform float uSpec;
+        uniform float uFogDensity;
+
+        varying vec3 vWorldPos;
+        varying vec3 vNormal;
+        varying float vFoam;
+        varying float vHeight;
+        ` +
+        atmosphereGLSL +
+        /* glsl */ `
+        void main() {
+          vec3 V = vWorldPos - cameraPosition;
+          float dist = length(V);
+          V /= dist;
+
+          vec3 n = normalize(vNormal);
+
+          // procedural detail ripples, faded with distance to avoid shimmer.
+          // second octave is rotated ~60 deg and counter-scrolled so the two
+          // layers never align into corduroy stripes
+          float detFade = uDetail / (1.0 + dist * 0.06);
+          mat2 rot = mat2(0.5, -0.866, 0.866, 0.5);
+          vec2 dp = vWorldPos.xz * 0.6 + vec2(uTime * 0.45, uTime * 0.2);
+          float e = 0.35;
+          #define RIPPLE(P) (vnoise(P) + 0.5 * vnoise(rot * (P) * 2.7 - vec2(uTime * 0.31, uTime * 0.12)))
+          float h0 = RIPPLE(dp);
+          float hx = RIPPLE(dp + vec2(e, 0.0));
+          float hz = RIPPLE(dp + vec2(0.0, e));
+          n = normalize(n + vec3(h0 - hx, 0.0, h0 - hz) * (detFade / e));
+
+          float NdV = max(dot(n, -V), 0.0);
+          float fres = 0.02 + 0.98 * pow(1.0 - NdV, 5.0);
+
+          vec3 R = reflect(V, n);
+          R.y = max(R.y, 0.02);
+          vec3 refl = skyRadiance(normalize(R));
+
+          // water body: deep color in troughs, scatter color at crests,
+          // plus light punching through crests when looking toward a low sun
+          float sunUp = clamp(uSunDir.y * 4.0, 0.0, 1.0);
+          vec3 body = mix(uWaterDeep, uWaterShallow, clamp(vHeight * 0.25 + 0.2, 0.0, 1.0));
+          float sss = pow(max(dot(V, -uSunDir) * 0.5 + 0.5, 0.0), 3.0);
+          sss *= clamp(vHeight * 0.6 + 0.3, 0.0, 1.5) * sunUp;
+          body += uWaterShallow * sss * 0.8;
+
+          vec3 col = mix(body, refl, fres);
+
+          // sun glitter: tight sparkle plus a broad sheen
+          vec3 H = normalize(-V + uSunDir);
+          float ndh = max(dot(n, H), 0.0);
+          float specMask = clamp(uSunDir.y * 8.0, 0.0, 1.0);
+          col += uSunTint * (pow(ndh, uSpecPower) * 1.2 + pow(ndh, uSpecPower * 0.08) * 0.08) * uSpec * specMask;
+
+          // moon glitter path
+          vec3 Hm = normalize(-V + uMoonDir);
+          float ndhm = max(dot(n, Hm), 0.0);
+          col += vec3(0.8, 0.9, 1.0) * (pow(ndhm, 900.0) * 2.2 + pow(ndhm, 90.0) * 0.03) * uMoon;
+
+          // foam, broken up by noise
+          float fn = vnoise(vWorldPos.xz * 0.9 + uTime * 0.25) * 0.6
+                   + vnoise(vWorldPos.xz * 3.1 - uTime * 0.2) * 0.4;
+          float foam = clamp(vFoam * uFoamAmount, 0.0, 1.5);
+          float fmask = smoothstep(0.45, 0.75, foam * (0.55 + 0.45 * fn));
+          vec3 foamCol = uHorizon * 1.1 + uSunTint * 0.4 + vec3(0.05);
+          col = mix(col, foamCol, fmask * clamp(uFoamAmount, 0.0, 1.0));
+
+          // lightning ambience on the water
+          col += vec3(0.55, 0.62, 0.8) * uLightning * 0.25;
+
+          // fade into the sky at the horizon (fog samples the actual sky)
+          vec3 hd = normalize(vec3(V.x, 0.0, V.z));
+          vec3 horizonCol = skyRadiance(hd);
+          float fogF = 1.0 - exp(-dist * uFogDensity);
+          col = mix(col, horizonCol, fogF);
+
+          col = acesTonemap(col * uExposure);
+          col = pow(col, vec3(0.4545));
+          col += (hash21(gl_FragCoord.xy) - 0.5) / 255.0;
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    ctx.scene.add(mesh);
+    this.mat = mat;
+  }
+  update(dt) {
+    const cur = this.ctx.cur, u = this.mat.uniforms;
+    this.waveTime += dt * cur.speedMul;
+    u.uWaveTime.value = this.waveTime;
+    u.uAmpMul.value = cur.ampMul;
+    u.uChopMul.value = cur.chopMul;
+    u.uWaterDeep.value.copy(cur.waterDeep);
+    u.uWaterShallow.value.copy(cur.waterShallow);
+    u.uFoamAmount.value = cur.foamAmount;
+    u.uDetail.value = cur.detail;
+    u.uSpecPower.value = cur.specPower;
+    u.uSpec.value = cur.spec;
+    u.uFogDensity.value = cur.fogDensity;
+  }
+}
+
+// ---- layers/rain.js ----
+
+/* ═══ COMPONENT: Rain + lightning (effects/weather) ═══
+   Rain as camera-wrapped line segments; owns the lightning scheduler and
+   writes the shared uLightning channel (sky + ocean read it). Gated by cur.rain
+   / cur.storminess so it is inert outside stormy states. */
+class Rain {
+  constructor(ctx) {
+    this.ctx = ctx;
+    const COUNT = 1100;
+    const AREA = 42;
+    const HEIGHT = 26;
+
+    const positions = new Float32Array(COUNT * 2 * 3);
+    const ends = new Float32Array(COUNT * 2); // 0 = head, 1 = tail
+    const seeds = new Float32Array(COUNT * 2);
+
+    for (let i = 0; i < COUNT; i++) {
+      const x = (ctx.rnd() - 0.5) * AREA;
+      const y = ctx.rnd() * HEIGHT;
+      const z = (ctx.rnd() - 0.5) * AREA - 6;
+      const seed = ctx.rnd();
+      for (let v = 0; v < 2; v++) {
+        const idx = (i * 2 + v) * 3;
+        positions[idx] = x;
+        positions[idx + 1] = y;
+        positions[idx + 2] = z;
+        ends[i * 2 + v] = v;
+        seeds[i * 2 + v] = seed;
+      }
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('aEnd', new THREE.BufferAttribute(ends, 1));
+    geo.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
+
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      uniforms: {
+        uTime: { value: 0 },
+        uRain: { value: 0 },
+        uSlant: { value: 1.5 },
+        uTint: { value: new THREE.Color(0.6, 0.68, 0.75) },
+        uCamY: { value: 13 },
+      },
+      vertexShader: /* glsl */ `
+        uniform float uTime;
+        uniform float uSlant;
+        uniform float uCamY;
+        attribute float aEnd;
+        attribute float aSeed;
+        varying float vFade;
+
+        void main() {
+          vec3 p = position;
+          float speed = 16.0 + aSeed * 9.0;
+          float len = 0.55 + aSeed * 0.4;
+          float h = 26.0;
+          p.y = mod(p.y - uTime * speed, h) + uCamY - h * 0.55;
+          // tail sits above the head, slanted by wind
+          p.y += aEnd * len;
+          p.x += aEnd * uSlant * 0.12 * len + (p.y - uCamY) * uSlant * 0.04;
+          vFade = 1.0 - aEnd * 0.85;
+          gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform float uRain;
+        uniform vec3 uTint;
+        varying float vFade;
+        void main() {
+          gl_FragColor = vec4(uTint, uRain * 0.22 * vFade);
+        }
+      `,
+    });
+
+    const mesh = new THREE.LineSegments(geo, mat);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 2;
+    ctx.scene.add(mesh);
+    this.mesh = mesh;
+    this.mat = mat;
+    this.nextStrike = 4;
+    this.strikes = [];
+    this._white = new THREE.Color(1, 1, 1);
+  }
+  lightningAt(t) {
+    const cur = this.ctx.cur;
+    if (cur.storminess > 0.5 && t > this.nextStrike) {
+      this.strikes.push(t);
+      this.nextStrike = t + 3 + this.ctx.rr(0, 8);
+    }
+    let v = 0;
+    for (let i = this.strikes.length - 1; i >= 0; i--) {
+      const age = t - this.strikes[i];
+      if (age > 1.2) { this.strikes.splice(i, 1); continue; }
+      v += Math.exp(-age * 9) * (0.65 + 0.35 * Math.sin(age * 85));
+    }
+    return Math.min(Math.max(v, 0), 1);
+  }
+  update(dt, t) {
+    const ctx = this.ctx, cur = ctx.cur, cam = ctx.camera, ru = this.mat.uniforms;
+    ctx.U.uLightning.value = this.lightningAt(t);
+    ru.uTime.value = t;
+    ru.uRain.value = cur.rain;
+    ru.uSlant.value = 1.5 + cur.storminess * 5.0;
+    ru.uTint.value.copy(cur.horizon).lerp(this._white, 0.4).multiplyScalar(0.6);
+    ru.uCamY.value = cam.position.y;
+    this.mesh.position.x = cam.position.x;
+    this.mesh.position.z = cam.position.z;
+    this.mesh.visible = cur.rain > 0.01;
+  }
+}
+
+// ---- camera.js ----
+
+/* ═══ COMPONENT: Camera ═══
+   A near-static bow view: the camera holds at deck height, breathing with a
+   gentle swell that scales with the sea state, plus subtle mouse parallax. */
+class CameraRig {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.CAM_HEIGHT = 13;
+    this.BASE_PITCH = -0.15; // slightly downward, horizon in the upper third
+    this.lookX = 0; this.lookY = 0;
+    this.smoothX = 0; this.smoothY = 0;
+
+    const cam = ctx.camera;
+    cam.position.set(0, this.CAM_HEIGHT, 0);
+    cam.rotation.order = 'YXZ';
+    cam.rotation.x = this.BASE_PITCH;
+
+    if (!ctx.reducedMotion) {
+      addEventListener('pointermove', (ev) => {
+        this.lookX = (ev.clientX / innerWidth - 0.5) * 2;
+        this.lookY = (ev.clientY / innerHeight - 0.5) * 2;
+      });
+    }
+  }
+  update(dt, t) {
+    if (this.ctx.reducedMotion) return;
+    const cam = this.ctx.camera, cur = this.ctx.cur;
+    cam.position.y = this.CAM_HEIGHT + Math.sin(t * 0.35) * 0.35 * (0.5 + cur.ampMul);
+    this.smoothX += (this.lookX - this.smoothX) * (1 - Math.exp(-dt * 3));
+    this.smoothY += (this.lookY - this.smoothY) * (1 - Math.exp(-dt * 3));
+    cam.rotation.y = -this.smoothX * 0.045;
+    cam.rotation.x = this.BASE_PITCH - this.smoothY * 0.03 + Math.sin(t * 0.22) * 0.004;
+  }
+}
+
+// ---- scene.js ----
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SCENE: Sea State — an open ocean seen from a ship's bow.
+   Factored manifest (SCENE_CONTRACT.md §8): state = "<time>-<weather>".
+   Layers: Sky (dome + clouds) · Ocean (Gerstner water) · Rain (+lightning).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const TIME_SET = { dawn: 1, midday: 1, dusk: 1, night: 1 };
+const WX_SET = { clear: 1, cloudy: 1, fog: 1, rain: 1, storm: 1 };
+let timeKey = 'dusk';
+let wxKey = 'clear';
+
+function parseHash(hash) {
+  const m = (hash || '').replace('#', '').split('-');
+  const tk = m[0] in TIME_SET ? m[0] : 'dusk';
+  const wk = m[1] in WX_SET ? m[1] : 'clear';
+  return [tk, wk];
+}
+
+const sceneDef = {
+  meta: { fov: 55, near: 0.5, far: 10000, pixelRatio: 2, rate: 1.4, seed: 7 },
+
+  buildUniforms() {
+    return {
+      uSunDir: V3(0, 1, 0), uSunTint: C3(), uZenith: C3(), uHorizon: C3(),
+      uGradFalloff: F(0.6), uSunDisc: F(1), uSunGlow: F(1),
+      uCloudCoverage: F(0.1), uCloudDensity: F(0.6), uCloudScale: F(1.1),
+      uCloudOff: { value: new THREE.Vector2(0, 0) }, uCloudLit: C3(), uCloudShadow: C3(),
+      uFogColor: C3(), uFogVeil: F(0.05), uStars: F(0),
+      uMoonDir: V3(0, 1, 0), uMoon: F(0), uLightning: F(0), uTime: F(0), uExposure: F(1),
+    };
+  },
+
+  initialState() {
+    [timeKey, wxKey] = parseHash(location.hash);
+    return `${timeKey}-${wxKey}`;
+  },
+
+  resolveState(name) {
+    const [tk, wk] = parseHash('#' + name);
+    return computeTarget(tk, wk);
+  },
+
+  // publish the shared palette every material reads (the sky-owned channels)
+  applyToUniforms(cur, ctx) {
+    const U = ctx.U;
+    U.uSunDir.value.copy(cur.sunDir).normalize();
+    U.uSunTint.value.copy(cur.sunTint);
+    U.uZenith.value.copy(cur.zenith);
+    U.uHorizon.value.copy(cur.horizon);
+    U.uGradFalloff.value = cur.gradFalloff;
+    U.uSunDisc.value = cur.sunDisc;
+    U.uSunGlow.value = cur.sunGlow;
+    U.uCloudCoverage.value = cur.cloudCoverage;
+    U.uCloudDensity.value = cur.cloudDensity;
+    U.uCloudScale.value = cur.cloudScale;
+    U.uCloudLit.value.copy(cur.cloudLit);
+    U.uCloudShadow.value.copy(cur.cloudShadow);
+    U.uFogColor.value.copy(cur.fogColor);
+    U.uFogVeil.value = cur.fogVeil;
+    U.uStars.value = cur.stars;
+    U.uMoonDir.value.copy(cur.moonDir).normalize();
+    U.uMoon.value = cur.moon;
+    U.uExposure.value = cur.exposure;
+  },
+
+  layers: [Sky, Ocean, Rain],
+  camera: CameraRig,
+
+  onHashChange(sm) {
+    [timeKey, wxKey] = parseHash(location.hash);
+    sm.setState(`${timeKey}-${wxKey}`);
+    syncButtons();
+    setForecast();
+  },
+
+  setupUI(ctx, sm) {
+    _sm = sm;
+    ui = document.getElementById('ui');
+    forecastEl = document.getElementById('forecast');
+    timeButtons = [...document.querySelectorAll('[data-time]')];
+    wxButtons = [...document.querySelectorAll('[data-weather]')];
+
+    timeButtons.forEach((b) => b.addEventListener('click', () => select(b.dataset.time, null)));
+    wxButtons.forEach((b) => b.addEventListener('click', () => select(null, b.dataset.weather)));
+
+    addEventListener('keydown', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      const k = ev.key.toLowerCase();
+      if (KEY_TIME[k]) select(KEY_TIME[k], null);
+      else if (KEY_WX[k]) select(null, KEY_WX[k]);
+      else if (k === 'h') ui.classList.toggle('hidden');
+    });
+
+    syncButtons();
+    forecastEl.textContent = forecastLine(timeKey, wxKey);
+  },
+};
+
+// ---- UI state (module-scoped, wired in setupUI) ----
+let _sm, ui, forecastEl, timeButtons = [], wxButtons = [];
+const KEY_TIME = { 1: 'dawn', 2: 'midday', 3: 'dusk', 4: 'night' };
+const KEY_WX = { q: 'clear', w: 'cloudy', e: 'fog', r: 'rain', t: 'storm' };
+
+function syncButtons() {
+  timeButtons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.time === timeKey)));
+  wxButtons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.weather === wxKey)));
+}
+function setForecast() {
+  forecastEl.classList.add('fading');
+  setTimeout(() => {
+    forecastEl.textContent = forecastLine(timeKey, wxKey);
+    forecastEl.classList.remove('fading');
+  }, 300);
+}
+function select(newTime, newWx) {
+  if (newTime) timeKey = newTime;
+  if (newWx) wxKey = newWx;
+  _sm.setState(`${timeKey}-${wxKey}`);
+  syncButtons();
+  history.replaceState(null, '', `#${timeKey}-${wxKey}`);
+  setForecast();
+}
+
+boot(document.getElementById('scene'), sceneDef);
+
+</script>
+</body>
+</html>
